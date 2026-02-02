@@ -1,0 +1,500 @@
+# Finn Backlog
+
+Features and enhancements for future versions.
+
+---
+
+## v1 Backlog
+
+Enhancements to the code-based orchestration layer. No new LLM components.
+
+---
+
+### Core Runtime
+
+#### Per-Tool Rate Limits
+
+Base has semaphore concurrency for steps. Add per-tool rate limits for commands/search that may have stricter API limits.
+
+#### Configurable Timeouts
+
+Per-agent timeout settings via config or flags.
+
+#### Extended Trace Fields
+
+Richer tracing for replay and debugging. Deferred from base to ship lean.
+
+**Add to StepRecord.trace:**
+- `repo_tree_hash_before/after` — per-step repo snapshots
+- `tool_calls` — `{ name, args_hash }[]`
+- `config_hash`, `rendered_prompt_hash`
+- `input_artifact_hashes` — artifact + key file hashes
+
+#### Action Ledger
+
+Full conflict detection (runtime). Base has `StepAction` with `action_id`, `pre_hash`, `post_hash`, `external_ref`. Action Ledger adds cross-step conflict detection and override tracking.
+
+```typescript
+interface ActionLedger {
+  run_id: string;
+  actions: Action[];
+  allow_conflicts: boolean;  // --allow-conflicts flag
+}
+
+interface Action {
+  action_id: string;  // "{step_id}:{idx}" or uuid
+  type: "edit_file" | "create_file" | "delete_file" | "external_call";
+  path: string;
+  idempotency_key: string;
+  patch_hash: string;
+  step_id: string;
+  supersedes_action_id?: string;
+  superseded_by_action_id?: string;
+}
+
+// Before applying an action
+function applyAction(ledger: ActionLedger, action: Action): boolean {
+  const existing = ledger.actions.find(a => a.idempotency_key === action.idempotency_key);
+  if (existing) {
+    if (existing.patch_hash === action.patch_hash) return false; // skip, already done
+
+    // Conflict: same target, different patch
+    if (!ledger.allow_conflicts) {
+      throw new ConflictError(existing, action);
+    }
+
+    // Override allowed: must be new step + record supersession
+    if (action.step_id === existing.step_id) {
+      throw new ConflictError(existing, action); // same step can't override itself
+    }
+
+    action.supersedes_action_id = existing.action_id;
+    existing.superseded_by_action_id = action.action_id;
+  }
+
+  ledger.actions.push(action);
+  return true; // proceed
+}
+```
+
+**Idempotency Key Schemes:**
+
+Line ranges drift as edits happen, making `{path}:{line_range}` fragile. Use stable identifiers:
+
+| Scheme | When to use | Example |
+|--------|-------------|---------|
+| `{path}:{function_name}` | Function/method edits (preferred) | `src/auth.ts:validateToken` |
+| `{path}:{class_name}` | Class-level changes | `src/user.ts:UserService` |
+| `{path}:{preimage_hash}` | Fallback when no symbol detected | `src/config.ts:a1b2c3d4` |
+
+```typescript
+function computeIdempotencyKey(path: string, content: string, range: CharRange): string {
+  // Try symbol detection first, fallback to preimage hash
+  const symbol = detectEnclosingSymbol(content, range);
+  if (symbol) return `${path}:${symbol.type}:${symbol.name}`;
+
+  const preimage = content.slice(range.start, range.end);
+  return `${path}:${hashPrefix(preimage, 8)}`;
+}
+```
+
+**Enables:** Conflict detection, audit trail, safe resume from partial runs, deterministic override with `--allow-conflicts`.
+
+#### DLQ Extensions
+
+Extends base DLQ (see FINN.md) with export and retention controls.
+
+**Export for handoff:**
+```bash
+finn export-dlq <run_id>  # generates capsule for human review / cross-session handoff
+```
+
+**Retention flags:**
+- `--keep-artifacts` — skip ephemeral workspace cleanup on success
+
+**Partial results:** `dlq-entry.data.partial_results` (already in base schema) — artifacts completed before failure, enabling smarter resume (skip completed work). Backlog: implement resume logic that uses this field.
+
+---
+
+### Safety Rails
+
+#### Orchestration Tripwires
+
+Deterministic triggers that extend v1 hardening:
+
+| Trigger | Action |
+|---------|--------|
+| 2+ retries fail | Mark run `needs_human`, reduce scope |
+| Tool output > N tokens | Mask + store full output as artifact |
+| Same file edited > K times | Escalate to re-plan |
+
+These are code policies, not LLM judgment.
+
+#### Budget Tracking
+
+Max parallel solves rate limits but not token/cost blowups. Track and enforce budgets at the run level.
+
+**RunRecord Extension:**
+
+```typescript
+budget: {
+  token_limit?: number;       // e.g., 50000
+  token_spent: number;        // running total from API responses
+  cost_limit_usd?: number;
+  cost_spent_usd: number;
+  exceeded: boolean;
+  exceeded_at_step?: string;
+}
+```
+
+**Behavior:**
+- Check budget before each step/subagent spawn
+- Current step completes if limit hit mid-call (don't interrupt)
+- No new steps spawn after exceeded
+- Run status → `BLOCKED` with `reason: "budget_exceeded"`
+
+**CLI:**
+```bash
+finn feat plan.md --token-budget=50000
+finn feat plan.md --cost-budget=1.00
+```
+
+---
+
+### Quality + Tooling
+
+#### Diminishing Returns Detection
+
+Stop loops when no progress is being made. Requires structured verifier output for deterministic comparison.
+
+**Verifier Issue Schema:**
+
+```typescript
+interface VerifierIssue {
+  id: string;              // stable: "{file}:{category}:{message_hash}"
+  file: string;
+  line?: number;           // optional, excluded from comparison (drifts)
+  category: IssueCategory; // type_error | logic_error | test_failure | ...
+  message: string;
+  severity: "error" | "warning" | "info";
+}
+```
+
+**Comparison:** Normalize issues (sort by file/category/severity, hash messages, exclude line numbers), then compare hashes across rounds.
+
+| Signal | Detection | Action |
+|--------|-----------|--------|
+| Same issues recurring | Hash match | BLOCKED |
+| Issue count plateau + same files | `r2.length >= r1.length` | BLOCKED |
+| Partial progress | `r2.length < r1.length` | Continue |
+
+#### Replay CLI
+
+CLI tooling for debugging and manual resume:
+
+```bash
+finn replay --run_id X              # replay full run
+finn replay --run_id X --from step3 # resume from step
+finn replay --run_id X --dry-run    # check invariants only
+```
+
+Basic replay for debugging. Eval/optimization replay is v2 (Eval Harness).
+
+#### Run Invariant Checker
+
+Lightweight validation command — proves correctness without LLM eval infrastructure.
+
+```bash
+finn check --run <run_id>
+```
+
+**Checks:**
+- No step exceeded `maxRetries`
+- Schema validated at every gate (all outputs match `schemaVersion`)
+- Deterministic ordering stable (sorted input digest matches)
+- No duplicate `action_id`s
+- All `artifact_ids` exist in Moss
+
+**Output:** Pass/fail with violations listed. Foundation for v2 Eval Harness.
+
+#### Progress Notifications
+
+Stream progress updates via MCP notifications.
+
+---
+
+## v2 Backlog
+
+Finn remains a deterministic orchestration runtime. v2 adds optional meta-reasoning, durable knowledge storage, and closed-loop optimization — implemented as separate components that consume Finn traces and update the inputs Finn uses (prompts, policies, knowledge).
+
+---
+
+### Advanced DAG Scheduling
+
+v1 uses static topological sort. v2 adds dynamic capabilities:
+
+| Feature | Description |
+|---------|-------------|
+| Dynamic step insertion | Add steps mid-run based on findings |
+| Speculative execution | Start steps before deps confirmed |
+| Conditional branches | Route based on step outputs |
+| Retry reordering | Try different step order on failure |
+
+---
+
+### Meta-Supervisor
+
+LLM invoked **only on escalation**, not always-on. Handles meta-level workflow decisions when deterministic policy cannot safely choose.
+
+**Triggers (deterministic):**
+- Tripwire fires (retries ≥ 2, thrashing, conflicts)
+- Deadline exceeded (token/time/budget cap)
+- Conflicting subagent outputs / verifier disagreement
+- Blocked state from diminishing returns heuristic
+
+**Input:** Small, structured, pointer-heavy — run summary artifact ID, relevant artifact IDs, last error, constraints, workspace context refs.
+
+**Output (constrained actions only):**
+
+| Action | Description |
+|--------|-------------|
+| `RESCOPE(new_task)` | Reduce scope to minimal viable step |
+| `REPLAN(new_outline)` | Different approach / ordering |
+| `REQUEST_HUMAN(question)` | Ask user for missing constraint |
+| `ABORT(reason)` | Stop safely with explanation |
+
+**Design:** Enterprise reliable — deterministic triggers, constrained outputs, auditable provenance.
+
+---
+
+### Run Finalizer
+
+Post-processing step after each Finn workflow (plan/feat/fix). Compiles run artifacts into durable state.
+
+#### Stage A — Deterministic (code, always-on)
+
+Pure extraction, cheap and testable:
+- `run_summary`: status, timestamps, IDs, workflow name, budgets
+- `run_index`: files touched, errors encountered, artifact provenance
+- `run_metrics`: rounds, retries, timeouts, token/cost stats
+- Hygiene: masking, size limits, DLQ state
+- Provenance: every artifact points back to source artifact IDs
+
+#### Stage B — Curated Knowledge Extraction (LLM, optional)
+
+Judgment-based distillation into pods:
+- Playbooks ("if verifier fails with X, try Y")
+- Pitfalls (gotchas tied to evidence)
+- Repo map updates
+- Resolves ambiguity when artifacts are messy
+
+**When to run:**
+- Successful runs (high-signal)
+- DLQ/blocked runs (valuable failure summaries)
+- Explicit flag (`--llm-finalize`)
+- Not after every run by default
+
+**Guardrails:**
+- Output schema + max tokens
+- Must include `sources: [artifact_ids]`
+- Write to pods only if confidence ≥ threshold
+- If LLM fails → skip, do not break the run
+
+---
+
+### Pods (Long-Lived Knowledge)
+
+Durable knowledge store. Distinct from artifacts (internal orchestration state) and capsules (external handoff to Claude Code).
+
+**Note:** Pods will be a Moss feature (`dev/pod.md`). Finn consumes pods for retrieval and writes via Finalizer.
+
+**Pod types:**
+- `reference_doc` — API docs, specs, papers
+- `repo_map` — stable layout + key entrypoints
+- `playbook` — if X happens, do Y
+- `pitfall` — gotchas tied to evidence
+- `workflow_notes` — what works for this repo
+
+**Retrieval (Step 0):** Before fan-out, query pods for relevant prior work:
+- Search by task keywords
+- Inject matches into subagent context
+- Ensures explorers leverage proven patterns and avoid past mistakes
+
+**Write:** Finalizer writes pods (gated + provenance).
+
+---
+
+### Optimization Pipeline
+
+External layer that improves prompts and policies using Finn traces. Finn emits traces; optimizer updates artifacts; Finn loads updated artifacts next run. **Consider:** Significant scope — evaluate LangSmith, Microsoft Agent Lightning, or similar before building custom.
+
+**Reference:** [Microsoft Agent Lightning](https://github.com/microsoft/agent-lightning)
+
+**Optimization targets:**
+- Prompt variants (explorers, verifiers, stitcher, meta-supervisor)
+- Routing thresholds (retry vs replan vs ask human)
+- Stop policies (diminishing returns thresholds)
+- Retrieval policies (which pods to fetch per stage)
+
+**Learning signals:**
+- Verifier pass/fail        ← LLM-based (risky)
+- Retry counts              ← non-LLM ✓
+- Time to completion        ← non-LLM ✓
+- Human escalations         ← non-LLM ✓
+- Blocked outcomes + reasons ← non-LLM ✓
+- Tests pass/fail           ← non-LLM ✓ (preferred)
+- Build passes              ← non-LLM ✓ (preferred)
+- Lint clean                ← non-LLM ✓ (preferred)
+- Human didn't revert       ← non-LLM ✓ (preferred)
+
+**Ground truth warning:** Prefer non-LLM signals. LLM-based signals (verifier pass) can create feedback loops — "self-licking ice cream cone" if verifier and optimizer both use LLMs.
+
+---
+
+### Eval Harness
+
+Validate prompt/policy changes before rollout. Builds on v1's basic replay. **Consider:** LangSmith already provides experiment tracking, prompt versioning, and eval comparison — evaluate before building custom.
+
+**Workflow:**
+1. Store traces from production runs (Run Records + artifacts)
+2. Replay workflows with candidate prompts/policies
+3. Compare success metrics across versions
+4. Promote winners, roll back regressions
+
+**Storage model:**
+
+| Data | Storage | Why |
+|------|---------|-----|
+| Run Records | Artifacts (`kind: "run-record"`) | Structured state, `run_id`/`phase`/`role` |
+| Golden marker | Tag on artifact | `tags: ["golden"]` |
+| Subagent outputs | Artifacts (per-kind schemas) | Typed JSON + rendered text |
+| Prompt variants | Pods | Free-form, may exceed 12K |
+| Eval reports | Pods | Comparison reports |
+
+**Replay for eval** (vs v1 replay for debug):
+- Swap prompts from pods during replay
+- Golden runs = Run Record artifacts with `tags: ["golden"]`
+- A/B comparison across prompt variants
+
+This is the feedback loop that guarantees improvement, not just change.
+
+---
+
+### Learned Stop Policy
+
+Train on run traces to predict when another round won't help. **Consider:** ML problem — research existing approaches before building custom.
+
+**v1:** Heuristic (hash comparison, issue-count plateau)
+**v2:** Learned thresholds per issue type ("auth tasks need 3 rounds", "refactors need 1")
+
+**Actions:** Stop + summarize, rescope, replan, ask human.
+
+**Key principle:** Learned policy is a *recommendation*, not authority. Code supervisor enforces hard caps; learned policy adjusts within safe bounds (suggests early stop, one extra round, or "ask human now"). Smart advisor, not smart ruler.
+
+---
+
+### Auto Mode (`--auto`)
+
+Policy-driven loop control. `--auto` selects named policies, not magic behavior.
+
+```bash
+finn feat plan.md --auto
+# Equivalent to:
+finn feat plan.md --stop-policy=default --budget-policy=default
+```
+
+**Explainable:** "stop-policy-v3 stopped because plateau for 2 rounds"
+
+**Why v2:** Requires policy infrastructure (versioned policies, learned stop policy). Without it, `--auto` is just hardcoded heuristics — v1 has the building blocks (diminishing returns heuristic, budget tracking), v2 composes them into selectable policies.
+
+---
+
+### Cross-Project Knowledge
+
+Optional. Share patterns across codebases via global pods workspace.
+
+**Requirements:**
+- Strict namespacing
+- Confidence + provenance required
+- Opt-in per project (default off)
+
+---
+
+### Implementation Order
+
+Safe sequencing — each step requires the previous:
+
+1. **Collect traces + outcomes** → Run Record (v1) — foundation for everything
+2. **Replay/eval harness** → Eval Harness — can't safely change what you can't measure
+3. **Optimize thresholds first** → Routing thresholds (low risk, easy to validate)
+4. **Learned stop policy** → Advisor mode (medium risk, bounded by hard caps)
+5. **Prompt optimization** → High risk, requires good evals to avoid regressions
+
+Don't skip to step 5 without step 2. "Optimizing prompts with no measurement" is a common trap.
+
+---
+
+### Policies as Configuration
+
+Runtime loads versioned policy artifacts:
+- `stop-policy-v17`
+- `routing-policy-v12`
+- `prompt-set-v8`
+
+Debugging becomes: "Why did we stop?" → `stop-policy-v17` recommended stop + hard cap reached.
+
+Policies are versioned, evaluated, promoted, rolled back — like code deploys.
+
+---
+
+### Stack Positioning
+
+```
+Optimization Pipeline ──→ updates prompts/policies
+         ↑ traces
+       Finn ──────────────→ deterministic orchestration + trace emission
+         │
+         ├── Finalizer ───→ Stage A (code) + Stage B (LLM, optional)
+         │        │
+         │        ↓
+         │      Pods ─────→ long-lived knowledge (via Moss)
+         │        ↑
+         ├── Subagents ───→ retrieve pods for context
+         │
+         └── Meta-supervisor → escalation-only LLM
+```
+
+---
+
+## v3 Backlog
+
+Event-driven Finn. Extends beyond "human invokes tool" to "system invokes workflow."
+
+---
+
+### Webhook / Pub-Sub Triggers
+
+External events trigger Finn workflows automatically.
+
+**Examples:**
+- GitHub PR opened → `finn__fix` with lint results → posts comment
+- CI failure → `finn__fix` with error logs
+- Scheduled cron → `finn__plan` for repo health check
+
+**Inspired by:** OpenClaw's webhook/cron/Gmail Pub-Sub integration.
+
+**Enables:** CI/CD integration, scheduled maintenance, event-driven workflows.
+
+---
+
+### Run Queue + Prioritization
+
+Manage multiple pending runs when webhooks/events trigger concurrently.
+
+**Features:**
+- Queue incoming runs
+- Prioritize by criteria (PR age, size, author, workflow type)
+- Concurrency control (`max_concurrent`)
+- Deduplication (same PR triggered twice → merge)
+
+**Prerequisite:** Webhook triggers (above).

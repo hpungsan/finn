@@ -1,6 +1,6 @@
 # Finn
 
-Deterministic workflow agents for Claude Code.
+Deterministic orchestration for Claude Code.
 
 ## Background
 
@@ -8,41 +8,55 @@ I built [Moss](https://github.com/hpungsan/moss) to handle context handoffs betw
 
 ## Problem
 
-The skills work on the happy path. But prompt-based skills have no error model.
-
-When I spawn a subagent via Task tool and it times out, fails mid-execution, or returns malformed output — how do I handle that in a skill? I can't. There's no try/catch. The skill says "spawn subagent" and hopes for the best. If it fails, the whole flow is in an undefined state.
-
-Skills are imperative scripts that assume success at every step. I wanted guarantees.
+Prompt-based skills can't guarantee execution. No try/catch, no enforced loops, no reliable parallelism. I wanted deterministic orchestration.
 
 ## Solution
 
-Move orchestration logic to TypeScript code while preserving Claude Code UX.
-
 - **Agent SDK** — Programmatic control over agent execution (`Promise.allSettled`, `for` loops, `try/catch`)
-- **MCP** — Expose agents as tools to Claude Code (user still types `/plan`, `/feat`, `/fix`)
-- **[Moss](https://github.com/hpungsan/moss)** — State management between agents (capsules scoped by `run_id`)
+- **MCP** — Expose workflows as tools to Claude Code (user still types `/plan`, `/feat`, `/fix`)
+- **[Moss](https://github.com/hpungsan/moss)** — State management between workflows (capsules scoped by `run_id`)
 
-User experience stays the same. Execution becomes deterministic.
+Same UX, deterministic control flow.
 
-## Agents
+## How It Works
 
-| Agent | Purpose | Based On |
-|-------|---------|----------|
-| **Plan** | Fan-out parallel explorers → fan-in → stitch into comprehensive plan | New |
-| **Feat** | Design review → implement → verify loops with enforced round limits | `.claude/skills/feature` |
-| **Fix** | Smart grouping (parallel vs sequential) based on file overlap | `.claude/skills/fix` |
+**Subagents do the thinking.** Explorers, verifiers, and stitchers are LLMs that make judgment calls — "what's relevant?", "is this correct?", "how do I combine these findings?"
 
-## Status
+**Code does the routing.** Code orchestrates the flow — loop control, fan-out/fan-in, timeout handling, retry policies. No LLM deciding "what's next?" when the answer is deterministic.
 
-Work in progress. See `dev/DESIGN.md` for architecture and `dev/BACKLOG.md` for roadmap.
+## Workflows
+
+| Workflow | Purpose | Pattern |
+|----------|---------|---------|
+| **Plan** | Comprehensive planning with full coverage | Fan-out parallel explorers → fan-in → stitch |
+| **Feat** | Implementation with design review loops | Design → implement → verify (enforced rounds) |
+| **Fix** | Smart fix execution based on file overlap | Group → parallel or sequential execution |
 
 ## Tech Stack
 
 - TypeScript
 - [Claude Agent SDK](https://github.com/anthropics/agent-sdk)
 - [MCP TypeScript SDK](https://modelcontextprotocol.io/docs/tools/typescript-sdk)
-- [Moss](https://github.com/hpungsan/moss) for agent coordination
+- [Moss](https://github.com/hpungsan/moss) for workflow coordination
+
+## Roadmap
+
+### v1 — Deterministic Orchestration
+Code-based hardening, no new LLM components.
+
+**Core** (see [FINN.md](docs/design/FINN.md)):
+- Run Record, rounds vs retries, structured output (Zod)
+
+**Backlog:**
+- Concurrency controls, basic replay, tripwires, DLQ + resume, auto mode
+
+### v2 — Meta Layer
+Optional components that consume traces and update Finn's inputs:
+- Meta-supervisor (escalation-only LLM for blocked states)
+- Run Finalizer (compile runs into capsules + pods)
+- Pods (long-lived knowledge via Moss)
+- Optimization Pipeline (improve prompts/policies from traces)
+
+See [docs/BACKLOG.md](docs/BACKLOG.md) for details.
 
 ## Related
-
-- [Moss](https://github.com/hpungsan/moss) — Local context capsule store for AI session handoffs
