@@ -9,27 +9,28 @@ TypeScript, Claude Agent SDK, MCP TypeScript SDK (@modelcontextprotocol/sdk), Mo
 ## Key Concepts
 - **Agent SDK**: Programmatic orchestration with guaranteed parallelism, loop control, error handling
 - **MCP Server**: Exposes `finn__plan`, `finn__feat`, `finn__fix` tools to Claude Code
-- **Moss**: State management via Artifacts (see Finn-Moss Architecture below)
+- **Artifacts**: Finn's internal durable state for orchestration (typed JSON with TTL)
+- **Moss**: External handoffs via Capsules (session summaries for humans/LLMs)
 
-## Finn-Moss Architecture
+## Architecture
 
 ### Layer Separation
 
 ```
-Finn ──→ Orchestration (code controls flow, spawns subagents, enforces limits)
+Finn ──→ Orchestration + State
+  │       ├── Workflows (plan, feat, fix)
+  │       └── Artifacts (internal durable state)
   │
-  └── Moss ──→ State (stores artifacts, manages lifecycle, enables coordination)
+  └── Moss ──→ External Handoffs (Capsules for humans/LLMs)
 ```
 
-Finn drives requirements. Moss provides primitives. Finn should not contort to fit Moss limitations — if Moss lacks a primitive, either add it to Moss or question whether Moss is the right layer.
+### Primitives
 
-### Moss Primitives
-
-| Primitive | Consumer | v1 Scope | Purpose |
-|-----------|----------|----------|---------|
-| **Artifacts** | Code | ✓ | Structured JSON (`data`) + rendered view (`text`). Explorer findings, verifier outputs, run records, DLQ entries. |
-| **Capsules** | Humans/LLMs | External only | 6-section markdown for session handoffs. Finn v1 doesn't store capsules — exports on demand. |
-| **Pods** | Humans/LLMs | v2 | Long-lived knowledge (playbooks, pitfalls, repo maps). |
+| Primitive | Owner | Consumer | Purpose |
+|-----------|-------|----------|---------|
+| **Artifacts** | Finn | Code | Structured JSON (`data`) + rendered view (`text`). Explorer findings, verifier outputs, run records, DLQ entries. |
+| **Capsules** | Moss | Humans/LLMs | 6-section markdown for session handoffs. Finn exports on demand. |
+| **Pods** | Moss | Humans/LLMs | Long-lived knowledge (v2). |
 
 ### Key Principle: Data is Truth, Text is View
 
@@ -56,11 +57,11 @@ text (markdown) ────→ derived view for LLMs, auto-generatable
 
 ## Workflows
 
-| Workflow | Pattern | Moss Usage |
-|----------|---------|------------|
-| **Plan** | Fan-out explorers → fan-in → stitch | Artifacts via `run_id`, `artifact_compose` |
-| **Feat** | Design → impl → verify loops | Artifact tracks review rounds |
-| **Fix** | Grouping + parallel/sequential execution | Artifact per fix session |
+| Workflow | Pattern | Artifact Usage |
+|----------|---------|----------------|
+| **Plan** | Fan-out explorers → fan-in → stitch | Findings scoped by `run_id` |
+| **Feat** | Design → impl → verify loops | Tracks review rounds |
+| **Fix** | Grouping + parallel/sequential execution | Per fix session |
 
 ## Commands
 ```bash
@@ -87,8 +88,10 @@ finn/
 │   │   └── stitcher.ts
 │   ├── grouping/
 │   │   └── fix-grouper.ts    # Overlap analysis
+│   ├── artifacts/
+│   │   └── store.ts          # Artifact storage layer
 │   └── moss/
-│       └── client.ts         # Moss MCP client wrapper
+│       └── client.ts         # Moss MCP client (for Capsule export)
 ├── package.json
 └── tsconfig.json
 ```
@@ -96,21 +99,23 @@ finn/
 ## Guidelines
 - Agent SDK for orchestration logic (loops, parallelism, error handling)
 - MCP for Claude Code integration
-- Moss for state management between agents
+- Artifacts for internal state management (Finn's storage layer)
+- Moss for external handoffs (Capsules)
 - Subagents are Agent SDK agents, not Claude Code Task subagents
 
 ## Docs
 | Doc | Purpose |
 |-----|---------|
-| `docs/design/FINN.md` | Architecture, Moss integration, project structure |
+| `docs/design/FINN.md` | Architecture, project structure |
 | `docs/design/plan.md` | Plan workflow: fan-out/fan-in, explorers, stitcher |
 | `docs/design/feat.md` | Feat workflow: design/impl/verify loops |
 | `docs/design/fix.md` | Fix workflow: grouping, parallel/sequential execution |
-| `dev/moss/artifact.md` | Moss Artifacts: structured state for code consumers |
+| `docs/design/artifacts.md` | Artifacts: Finn's durable state layer |
+| `docs/design/artifact-backlog.md` | Artifact store: deferred features |
 | `docs/BACKLOG.md` | Future features and improvements |
 
 ## References
 - [Agent SDK - TypeScript](https://platform.claude.com/docs/en/agent-sdk/typescript.md) — API reference
 - [Agent SDK - Subagents](https://platform.claude.com/docs/en/agent-sdk/subagents.md) — Subagent patterns
 - [MCP TypeScript SDK](https://modelcontextprotocol.io/docs/tools/typescript-sdk) — MCP server implementation
-- [Moss](https://github.com/hpungsan/moss) — State management for workflow coordination
+- [Moss](https://github.com/hpungsan/moss) — External handoffs via Capsules

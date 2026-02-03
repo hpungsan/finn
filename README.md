@@ -14,7 +14,8 @@ Prompt-based skills can't guarantee execution. No try/catch, no enforced loops, 
 
 - **Agent SDK** — Programmatic control over agent execution (`Promise.allSettled`, `for` loops, `try/catch`)
 - **MCP** — Expose workflows as tools to Claude Code (user still types `/plan`, `/feat`, `/fix`)
-- **[Moss](https://github.com/hpungsan/moss)** — State management between workflows (capsules scoped by `run_id`)
+- **Artifacts** — Finn's internal durable state layer (typed JSON, scoped by `run_id`)
+- **[Moss](https://github.com/hpungsan/moss)** — External handoffs via capsules
 
 Same UX, deterministic control flow.
 
@@ -37,7 +38,7 @@ Same UX, deterministic control flow.
 - TypeScript
 - [Claude Agent SDK](https://github.com/anthropics/agent-sdk)
 - [MCP TypeScript SDK](https://modelcontextprotocol.io/docs/tools/typescript-sdk)
-- [Moss](https://github.com/hpungsan/moss) for workflow coordination
+- [Moss](https://github.com/hpungsan/moss) for external handoffs (capsules)
 
 ## Roadmap
 
@@ -59,4 +60,6 @@ Optional components that consume traces and update Finn's inputs:
 
 See [docs/BACKLOG.md](docs/BACKLOG.md) for details.
 
-## Related
+## License
+
+MIT

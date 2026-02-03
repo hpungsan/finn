@@ -3,7 +3,7 @@
 Implements a feature from a plan file with design review and verification loops.
 
 **Input:** Plan file path
-**Output:** Status, files changed + summary capsule (Moss, for Claude Code handoff)
+**Output:** Status, files changed + summary capsule (via Moss, for Claude Code handoff)
 
 ---
 

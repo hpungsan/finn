@@ -210,10 +210,10 @@ finn check --run <run_id>
 
 **Checks:**
 - No step exceeded `maxRetries`
-- Schema validated at every gate (all outputs match `schemaVersion`)
+- Schema validated at every gate (all outputs match `schema_version`)
 - Deterministic ordering stable (sorted input digest matches)
 - No duplicate `action_id`s
-- All `artifact_ids` exist in Moss
+- All `artifact_ids` exist in store
 
 **Output:** Pass/fail with violations listed. Foundation for v2 Eval Harness.
 
@@ -221,11 +221,40 @@ finn check --run <run_id>
 
 Stream progress updates via MCP notifications.
 
+#### Runner Version in step_instance_id
+
+Add `runner_version` (Finn git SHA or package.json version) to `step_instance_id` hash. Forces cache invalidation when orchestration semantics change, even if prompt/schema unchanged.
+
+```
+step_instance_id = hash(step_id, inputs_digest, schema_version, prompt_version, runner_version)
+```
+
+#### Store Diffs in StepAction
+
+Add optional `diff` field to `StepAction` for auditability and replay.
+
+```typescript
+interface StepAction {
+  // ... existing fields
+  diff?: string;  // unified diff for file edits
+}
+```
+
+**Trade-off:** Storage vs auditability. Store diff only for edits under size threshold (e.g., <10KB diff). Large diffs get hash-only.
+
+**Enables:** Audit trail, optional replay, "human required" debugging.
+
 ---
 
 ## v2 Backlog
 
 Finn remains a deterministic orchestration runtime. v2 adds optional meta-reasoning, durable knowledge storage, and closed-loop optimization — implemented as separate components that consume Finn traces and update the inputs Finn uses (prompts, policies, knowledge).
+
+---
+
+### Multi-Process Run Ownership
+
+v1 invariant: a run is owned by a single Finn process (`owner_id` check). v2 could lift this with distributed locking or leader election for scenarios like horizontally-scaled workers processing a shared run queue.
 
 ---
 
@@ -264,6 +293,31 @@ LLM invoked **only on escalation**, not always-on. Handles meta-level workflow d
 | `ABORT(reason)` | Stop safely with explanation |
 
 **Design:** Enterprise reliable — deterministic triggers, constrained outputs, auditable provenance.
+
+---
+
+### Verifier Council
+
+Multiple verifiers review independently, majority vote on verdict. Inspired by [LLM Council](https://github.com/karpathy/llm-council).
+
+**Rationale:** Verifier verdicts drive the core loop. Wrong verdicts are expensive:
+- False positive (finds issues that aren't) → unnecessary rounds, thrashing
+- False negative (misses issues) → ships broken code
+
+**How it works:**
+1. Fan-out: 3 verifiers review independently (same input, different model instances or prompts)
+2. Collect verdicts: PASS / CONCERNS / FAIL
+3. Majority vote determines outcome
+4. Disagreement (e.g., 1 PASS, 1 CONCERNS, 1 FAIL) → escalate to meta-supervisor or human
+
+**When to enable:**
+- High-stakes workflows (production deployments)
+- Tasks with ambiguous correctness criteria
+- When false negatives are costly
+
+**Trade-off:** 3x verifier cost + latency. Opt-in for critical paths, not default.
+
+**Extension:** Could also apply to meta-supervisor decisions (RESCOPE vs REPLAN vs ABORT) and eval harness judges.
 
 ---
 
@@ -450,18 +504,24 @@ Policies are versioned, evaluated, promoted, rolled back — like code deploys.
 ### Stack Positioning
 
 ```
-Optimization Pipeline ──→ updates prompts/policies
+Optimization Pipeline ──→ updates prompts/policies (external)
          ↑ traces
        Finn ──────────────→ deterministic orchestration + trace emission
          │
-         ├── Finalizer ───→ Stage A (code) + Stage B (LLM, optional)
-         │        │
-         │        ↓
-         │      Pods ─────→ long-lived knowledge (via Moss)
-         │        ↑
-         ├── Subagents ───→ retrieve pods for context
+         ├── Workflows ────→ plan, feat, fix (control flow)
          │
-         └── Meta-supervisor → escalation-only LLM
+         ├── Subagents ────→ explorers, verifiers, stitcher (LLM reasoning)
+         │        │
+         │        ↓ retrieve
+         │      Pods ──────→ long-lived knowledge (via Moss)
+         │
+         ├── Artifact Store → internal durable state (run records, findings)
+         │
+         ├── Finalizer ────→ Stage A (code) + Stage B (LLM, optional)
+         │        │
+         │        └───────→ writes to Pods (via Moss)
+         │
+         └── Meta-supervisor → escalation-only LLM (v2)
 ```
 
 ---

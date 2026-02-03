@@ -3,7 +3,7 @@
 Fixes issues with smart grouping for parallel/sequential execution.
 
 **Input:** Issues (text or structured)
-**Output:** Status per group, issues fixed + summary capsule (Moss, for Claude Code handoff)
+**Output:** Status per group, issues fixed + summary capsule (via Moss, for Claude Code handoff)
 
 ---
 

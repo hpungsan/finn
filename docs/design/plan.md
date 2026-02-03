@@ -3,7 +3,7 @@
 Explores codebase via parallel subagents and synthesizes comprehensive plan.
 
 **Input:** Task description (string)
-**Output:** Plan file (disk) + summary capsule (Moss, for Claude Code handoff)
+**Output:** Plan file (disk) + summary capsule (via Moss, for Claude Code handoff)
 
 ---
 
@@ -135,4 +135,4 @@ Combines explorer findings into coherent, comprehensive plan.
 | Explorer crashes | Log error, continue with other findings |
 | All explorers fail | Return error, no plan generated |
 | Stitcher fails | Return raw findings, let user stitch manually |
-| Moss unavailable | Fallback to in-memory state (degraded) |
+| Artifact store unavailable | Fallback to in-memory state (degraded) |

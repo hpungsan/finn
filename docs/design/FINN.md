@@ -28,15 +28,82 @@ See [BACKLOG.md](../BACKLOG.md) for future scope.
 
 ---
 
-## Moss Primitives
+## Primitives
 
-| Type | Scope | Usage |
-|------|-------|-------|
-| **Artifacts** | Internal | Explorer findings, verifier outputs, run records, DLQ entries (TTL, code operates on `data`) |
-| **Capsules** | External | Workflow summary, handoff exports (to Claude Code / future sessions) |
-| **Pods** | Persistent | Playbooks, pitfalls, repo maps **(v2)** |
+| Type | Owner | Scope | Usage |
+|------|-------|-------|-------|
+| **Artifacts** | Finn | Internal | Explorer findings, verifier outputs, run records, DLQ entries (TTL, code operates on `data`) |
+| **Capsules** | Moss | External | Workflow summary, handoff exports (to Claude Code / future sessions) |
+| **Pods** | Moss | Persistent | Playbooks, pitfalls, repo maps **(v2)** |
 
-Artifacts are Finn's internal state. Capsules are generated on demand for external handoff.
+Artifacts are Finn's internal state layer. Capsules are generated on demand for external handoff via Moss.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        CLAUDE CODE                               │
+│                                                                  │
+│   User: /plan, /feat, /fix                                      │
+│          ↓                                                       │
+│   Claude invokes MCP tools: finn__plan, finn__feat, finn__fix   │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                           FINN                                   │
+│                                                                  │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                    MCP SERVER                              │  │
+│  │  finn__plan, finn__feat, finn__fix                        │  │
+│  └─────────────────────────┬─────────────────────────────────┘  │
+│                            │                                     │
+│                            ▼                                     │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                    WORKFLOWS                               │  │
+│  │  plan.ts, feat.ts, fix.ts                                 │  │
+│  │  (loops, fan-out/fan-in, error handling)                  │  │
+│  └─────────────────────────┬─────────────────────────────────┘  │
+│                            │                                     │
+│            ┌───────────────┼───────────────┐                    │
+│            ▼               ▼               ▼                    │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐            │
+│  │  SUBAGENTS   │ │  SUBAGENTS   │ │  SUBAGENTS   │            │
+│  │  explorers   │ │  verifiers   │ │  stitcher    │            │
+│  └──────┬───────┘ └──────┬───────┘ └──────┬───────┘            │
+│         │                │                │                     │
+│         └────────────────┼────────────────┘                     │
+│                          ▼                                      │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                  ARTIFACT STORE                            │  │
+│  │  store(), fetch(), list(), compose()                      │  │
+│  │                                                            │  │
+│  │  Implementations:                                          │  │
+│  │  - SqliteArtifactStore (production)                       │  │
+│  │  - InMemoryArtifactStore (tests)                          │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ (on-demand export)
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                          MOSS                                    │
+│                                                                  │
+│   Capsules → session handoffs for humans/LLMs                   │
+│   Pods → long-lived knowledge (v2)                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+| Layer | Owns | Does |
+|-------|------|------|
+| **MCP Server** | Tool definitions | Routes Claude Code calls to workflows |
+| **Workflows** | Control flow | Loops, fan-out/fan-in, retries, timeouts |
+| **Subagents** | Judgment | Explore, verify, stitch (LLM reasoning) |
+| **Artifact Store** | Durable state | Store/fetch/list/compose typed JSON |
+| **Moss** | External handoffs | Capsules for session summaries |
 
 ---
 
@@ -173,13 +240,14 @@ interface Step<T = unknown> {
   deps: string[];           // step IDs that must complete first
   timeout: number;          // per-step timeout (ms), overrides default
   maxRetries: number;       // per-step retry limit, overrides default
-  schemaVersion: string;    // output schema version for replay correctness
+  prompt_version: string;   // required for replay correctness, e.g., "code-explorer@2"
+  schema_version: string;   // required for replay correctness, e.g., "explorer-finding@1"
   run(ctx: StepContext): Promise<StepResult<T>>;
 }
 
 interface StepContext {
   run_id: string;
-  moss: MossClient;
+  store: ArtifactStore;
   config: RunConfig;
   artifacts: Map<string, unknown>;  // outputs from completed deps
 }
@@ -202,9 +270,11 @@ Ordering for crash consistency:
 
 1. Record step RUNNING → **persist RunRecord**
 2. Run subagent
-3. Write output artifacts to Moss
-4. Write step-result artifact (`kind: "step-result"`, name: `step_instance_id`)
+3. Write output artifacts to store
+4. Write step-result artifact (`kind: "step-result"`, name: `step_instance_id`, run_id: `run_id`)
 5. Record step OK/BLOCKED/FAILED → **persist RunRecord**
+
+**Note:** Step-results must include `run_id` even though name is `step_instance_id`. This enables listing all step-results for a run, GC by run TTL, and debugging without knowing every step_instance_id.
 
 **Crash recovery:** If crash between (4) and (5), on resume:
 - Step shows RUNNING in RunRecord
@@ -213,6 +283,8 @@ Ordering for crash consistency:
 
 This makes crash recovery provably correct: step-result artifact is atomic proof of completion.
 
+**SQLite atomicity:** Step-result artifact + RunRecord event append should be a single SQLite transaction (`BEGIN IMMEDIATE`) when possible. RunWriter serializes writes through one connection. Crash recovery logic handles edge cases where transaction isn't achievable.
+
 **Fan-out writes:** Multiple explorers finishing concurrently will race to persist. Serialize RunRecord writes through a single in-process RunWriter queue. Steps finish in any order; persistence is serialized. Steps publish events to RunWriter; only RunWriter mutates the RunRecord.
 
 **Repo hashing (v1):**
@@ -220,13 +292,24 @@ This makes crash recovery provably correct: step-result artifact is atomic proof
 - Non-git: literal `"non-git"` + timestamp
 - Audit metadata, not correctness-critical
 
+**Inputs canonicalization:** `inputs_digest` must be deterministic and change if any upstream output changes. Before hashing:
+- Include `repo_hash` for steps that read from the repo (ensures cross-run caching is only valid when repo state matches)
+- Include artifact `version` in refs, not just name/id (detects upstream changes even if name unchanged)
+- Sort artifact refs by `(workspace, name ?? id)`
+- Sort file lists alphabetically
+- Normalize paths (forward slashes, no trailing slash)
+- Use `fast-json-stable-stringify` for deterministic serialization (sorted keys, recursive)
+
 ### Run Record
 
 Single source of truth for workflow execution. Scripts → platform.
 
+**v1 invariant:** A run is owned by a single Finn process. Concurrent ownership is unsupported. On RunRecord update, check `owner_id` matches → fail fast on mismatch with error: "Run owned by another process."
+
 ```typescript
 interface RunRecord {
   run_id: string;
+  owner_id: string;     // random UUID generated on Finn process startup
   status: "RUNNING" | "OK" | "BLOCKED" | "FAILED";
   workflow: "plan" | "feat" | "fix";
   args: WorkflowArgs;
@@ -250,7 +333,7 @@ interface StepRecord {
   name: string;
   status: Status;            // derived from last event
 
-  inputs_digest: string;     // hash of step inputs + artifact refs
+  inputs_digest: string;     // hash of step inputs + artifact refs (canonicalized)
   schema_version: string;    // output schema version
   events: StepEvent[];       // append-only, crash-safe
   artifact_ids: string[];    // artifact IDs created by this step
@@ -261,13 +344,19 @@ interface StepRecord {
   trace?: {
     model: string;
     prompt_version: string;
+    inputs_digest: string;
+    artifact_ids_read: string[];  // artifacts consumed by this step
   };
 }
 
 type StepEvent =
   | { type: "STARTED"; at: string }
-  | { type: "RETRY"; at: string; error: ErrorCode }
+  | { type: "RETRY"; at: string; error: ErrorCode; repair_attempt?: boolean }
   | { type: "OK" | "BLOCKED" | "FAILED"; at: string };
+
+// Zod repair: If output fails validation, attempt one repair call.
+// - If repair succeeds → no event logged (transparent fix)
+// - If repair fails → log RETRY with error: "SCHEMA_INVALID", repair_attempt: true
 
 type Status = "PENDING" | "RUNNING" | "OK" | "RETRYING" | "BLOCKED" | "FAILED";
 
@@ -296,7 +385,7 @@ type ErrorCode =
 - Tripwire tracking (retries, thrashing)
 - Audit trail
 
-**Persisted via Moss:**
+**Persisted via ArtifactStore:**
 ```typescript
 // Initial create
 artifact_store({
@@ -322,7 +411,7 @@ artifact_store({
 });
 ```
 
-**Optimistic concurrency:** `expected_version` implies update — Moss rejects if version doesn't match or artifact not found. No race window between read and write.
+**Optimistic concurrency:** `expected_version` implies update — store rejects if version doesn't match or artifact not found. No race window between read and write.
 
 **VERSION_MISMATCH handling:** On conflict, single retry with warning log. If retry also fails, fail with error: "Run may be owned by another process." Conflicts are unexpected (RunWriter queue serializes in-process writes). Repeated conflicts indicate concurrent processes or bug — investigate, don't silently loop.
 
@@ -413,62 +502,6 @@ When a workflow fails after retries exhausted, store failure state for later res
 
 ---
 
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                       CLAUDE CODE                            │
-│                                                              │
-│   User: /plan "add user authentication"                     │
-│          ↓                                                   │
-│   Claude invokes MCP tool: finn__plan                       │
-└──────────────────────────────────────────────────────────────┘
-                             │
-                             ▼
-┌──────────────────────────────────────────────────────────────┐
-│                    FINN MCP SERVER                           │
-│                                                              │
-│   Tools:                                                     │
-│     finn__plan(task) ──────→ Plan workflow                  │
-│     finn__feat(planFile) ──→ Feat workflow                  │
-│     finn__fix(issues) ─────→ Fix workflow                   │
-└──────────────────────────────────────────────────────────────┘
-                             │
-            ┌────────────────┼────────────────┐
-            ▼                ▼                ▼
-     ┌────────────┐   ┌────────────┐   ┌────────────┐
-     │    Plan    │   │    Feat    │   │    Fix     │
-     │  workflow  │   │  workflow  │   │  workflow  │
-     │            │   │            │   │            │
-     │ fan-out →  │   │ design →   │   │ group →    │
-     │ fan-in →   │   │ impl →     │   │ parallel/  │
-     │ stitch     │   │ verify     │   │ sequential │
-     └────────────┘   └────────────┘   └────────────┘
-            │                │                │
-            │       Spawns Subagents          │
-            │                │                │
-            ▼                ▼                ▼
-     ┌─────────────────────────────────────────────┐
-     │              SUBAGENTS                       │
-     │                                              │
-     │  Explorers: code, test, doc, migration      │
-     │  Verifiers: design-verifier, impl-verifier  │
-     │  Stitcher: synthesize findings into plan    │
-     └─────────────────────────────────────────────┘
-            │                │                │
-            │    State via Moss Artifacts     │
-            ▼                ▼                ▼
-     ┌─────────────────────────────────────────────┐
-     │                   MOSS                       │
-     │                                              │
-     │  workspace: plan | feat | fix               │
-     │  run_id: scopes explorer findings           │
-     │  Subagent memory across rounds              │
-     └─────────────────────────────────────────────┘
-```
-
----
-
 ## Workflows Overview
 
 | Workflow | Pattern | Design Doc |
@@ -491,78 +524,15 @@ All subagents live at Finn level (`finn/src/subagents/`), making Finn self-conta
 
 ---
 
-## Moss Usage
+## Artifact Usage
 
-### ArtifactStore Interface
+See [artifacts.md](artifacts.md) for full spec (interface, types, storage implementation).
 
-Finn accesses Moss artifacts through an interface, enabling unit tests without running Moss.
-
-```typescript
-// v1: core operations only. delete/touch added as needed.
-interface ArtifactStore {
-  store(opts: StoreOpts): Promise<Artifact>;
-  fetch(opts: FetchOpts): Promise<Artifact>;
-  list(opts: ListOpts): Promise<ListResult>;
-  compose(opts: ComposeOpts): Promise<ComposeResult>;
-}
-
-type StoreOpts = {
-  workspace: string;
-  name?: string;
-  kind: string;
-  data: unknown;
-  text?: string;
-  run_id?: string;
-  phase?: string;
-  role?: string;
-  ttl_seconds?: number | null;
-  expected_version?: number;  // optimistic locking for RunRecord
-  mode?: "error" | "replace";
-};
-
-type FetchOpts = {
-  id?: string;              // by ID
-  workspace?: string;       // by name (requires workspace)
-  name?: string;
-};
-
-type ListOpts = {
-  workspace?: string;
-  run_id?: string;
-  kind?: string;
-  phase?: string;
-  role?: string;
-  limit?: number;
-  offset?: number;
-};
-
-type ListResult = {
-  items: Artifact[];  // includes data, excludes text
-  pagination: { limit: number; offset: number; has_more: boolean };
-};
-
-type ComposeOpts = {
-  items: Array<{ id?: string; workspace?: string; name?: string }>;
-  format?: "markdown" | "json";
-};
-
-type ComposeResult = {
-  bundle_text: string;  // format: "markdown"
-} | {
-  parts: Array<{ id: string; name?: string; data: unknown; text: string }>;  // format: "json"
-};
-```
-
-| Implementation | Use |
-|----------------|-----|
-| `McpArtifactStore` | Production — calls Moss via MCP |
-| `InMemoryArtifactStore` | Tests — no external dependency |
-
-Workflows depend on the interface, not the implementation. Tests can verify `VERSION_MISMATCH` behavior, pagination, and filtering without Moss running.
+This section covers how **workflows use artifacts** — TTL policies, naming conventions, and workflow-specific patterns.
 
 ### TTL Policy
 
-Moss provides the mechanism (`ttl_seconds` on `artifact_store`). Finn owns the policy — what TTL to use for each artifact type.
+The artifact store provides the mechanism (`ttl_seconds` on store). Finn owns the policy — what TTL to use for each artifact type.
 
 ```typescript
 // Finn's TTL policy (constants)
@@ -584,9 +554,9 @@ const WORKSPACE_TTL: Record<string, number | null> = {
 };
 
 // Wrapper applies TTL based on workspace (unless overridden)
-function storeArtifact(opts: ArtifactStoreOpts) {
+function storeArtifact(store: ArtifactStore, opts: ArtifactStoreOpts) {
   const ttl = opts.ttl_seconds ?? WORKSPACE_TTL[opts.workspace];
-  return moss.artifact_store({ ...opts, ttl_seconds: ttl });
+  return store.store({ ...opts, ttl_seconds: ttl });
 }
 ```
 
@@ -597,6 +567,15 @@ function storeArtifact(opts: ArtifactStoreOpts) {
 | `fix` | 2 hours | Fix session state |
 | `runs` | 7d / 30d | Run Records, step-results (success / failure) |
 | `dlq` | persistent | DLQ entries for resume |
+
+### Size Limits
+
+The artifact store has a ceiling (200K chars for data, 12K for text). Finn enforces kind-specific limits before storing.
+
+| Kind | Data Limit | Rationale |
+|------|------------|-----------|
+| `run-record` | 200K | Grows unboundedly (steps × events) |
+| All others | 50K | Bounded per-step output |
 
 ### Artifact Per Workflow
 
@@ -632,7 +611,7 @@ run_id: "{workflow}-{slug}-{timestamp}"
 await storeArtifact({ workspace: "plan", run_id, role: "code-explorer", kind: "explorer-finding", data, ... });
 
 // Fan-in: gather all findings (returns data, not just metadata)
-const findings = await moss.artifact_list({ run_id, kind: "explorer-finding" });
+const findings = await store.list({ run_id, kind: "explorer-finding" });
 
 // Cleanup: ephemeral findings auto-expire via TTL (1 hour for plan workspace)
 ```
@@ -698,7 +677,7 @@ This ensures:
 
 ### Text Rendering
 
-Finn renders `text` from `data` before storing. Moss stores what's given.
+Finn renders `text` from `data` before storing.
 
 ```typescript
 const RENDERERS: Record<ArtifactKind, (data: unknown) => string> = {
@@ -725,7 +704,7 @@ await storeArtifact({
 });  // → ttl_seconds: 7200 (2 hours)
 
 // Round 2: fetch previous, compare issues
-const prev = await moss.artifact_fetch({ workspace: "feat", name: `${run_id}-verifier-r1` });
+const prev = await store.fetch({ workspace: "feat", name: `${run_id}-verifier-r1` });
 const resolved = prev.data.issues.filter(i => !currentIssues.has(i.id));
 ```
 
@@ -733,15 +712,15 @@ const resolved = prev.data.issues.filter(i => !currentIssues.has(i.id));
 
 > **v1 note:** Optimization logic deferred until /plan works end-to-end.
 
-`artifact_list` returns `data` by default, enabling code to operate without full fetch:
+`list()` returns `data` by default, enabling code to operate without full fetch:
 
 ```typescript
 // List returns structured data — code can sort/filter/dedupe
-const findings = await moss.artifact_list({ run_id, kind: "explorer-finding" });
+const findings = await store.list({ run_id, kind: "explorer-finding" });
 const highPriority = findings.items.filter(f => f.data.confidence > 0.8);
 
 // Only fetch full text when needed for LLM consumption
-const bundle = await moss.artifact_compose({
+const bundle = await store.compose({
   items: highPriority.map(f => ({ id: f.id })),
 });
 ```
@@ -751,7 +730,7 @@ const bundle = await moss.artifact_compose({
 Bundle artifact text views into single context for LLM consumption:
 
 ```typescript
-const bundle = await moss.artifact_compose({
+const bundle = await store.compose({
   items: [
     { workspace: "plan", name: `${run_id}-code-explorer` },
     { workspace: "plan", name: `${run_id}-test-explorer` },
@@ -833,8 +812,21 @@ finn/
 │   │   └── stitcher.ts
 │   ├── grouping/
 │   │   └── fix-grouper.ts    # Overlap analysis
+│   ├── artifacts/            # Storage layer (see artifacts.md)
+│   │   ├── store.ts          # ArtifactStore interface
+│   │   ├── sqlite.ts         # SqliteArtifactStore
+│   │   └── memory.ts         # InMemoryArtifactStore
+│   ├── schemas/              # Zod schemas per artifact kind
+│   │   ├── explorer-finding.ts
+│   │   ├── verifier-output.ts
+│   │   └── run-record.ts
+│   ├── policies/
+│   │   └── ttl.ts            # TTL constants per workspace/kind
+│   ├── renderers/            # Text renderers (data → markdown)
+│   │   ├── explorer.ts
+│   │   └── verifier.ts
 │   └── moss/
-│       └── client.ts         # Moss MCP client
+│       └── client.ts         # Moss MCP client (Capsule export)
 ├── package.json
 └── tsconfig.json
 ```
