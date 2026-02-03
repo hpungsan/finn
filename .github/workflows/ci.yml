@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+
+      - name: Install
+        run: npm ci
+
+      - name: Lint + Typecheck
+        run: npm run check
+
+      - name: Vulnerability check
+        run: npm audit --audit-level=moderate
+
+      - name: Test
+        run: npm test
+
+      # TODO: Add coverage when tests grow
+      # - name: Test with coverage
+      #   run: npm test -- --coverage
+      #
+      # - name: Upload coverage
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: coverage
+      #     path: coverage/
