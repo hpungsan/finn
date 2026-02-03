@@ -827,9 +827,13 @@ finn/
 │   ├── grouping/
 │   │   └── fix-grouper.ts    # Overlap analysis
 │   ├── artifacts/            # Storage layer (see artifacts.md)
+│   │   ├── index.ts          # Public exports
+│   │   ├── types.ts          # Artifact, StoreOpts, etc.
+│   │   ├── errors.ts         # ArtifactError, ErrorCode
 │   │   ├── store.ts          # ArtifactStore interface
-│   │   ├── sqlite.ts         # SqliteArtifactStore
-│   │   └── memory.ts         # InMemoryArtifactStore
+│   │   ├── normalize.ts      # Name/workspace normalization
+│   │   ├── memory.ts         # InMemoryArtifactStore (Stage 2)
+│   │   └── sqlite.ts         # SqliteArtifactStore (Stage 3)
 │   ├── schemas/              # Zod schemas per artifact kind
 │   │   ├── explorer-finding.ts
 │   │   ├── verifier-output.ts

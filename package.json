@@ -1,5 +1,29 @@
 {
+  "name": "finn",
+  "version": "0.1.0",
+  "type": "module",
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.29"
+    "@anthropic-ai/claude-agent-sdk": "^0.2.29",
+    "better-sqlite3": "^11.0.0",
+    "ulid": "^2.3.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.3.13",
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^4.0.18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "fmt": "biome check --write src",
+    "lint": "biome check src",
+    "typecheck": "tsc --noEmit",
+    "check": "biome check src && tsc --noEmit",
+    "ok": "npm run fmt && npm run typecheck && npm test"
   }
 }
