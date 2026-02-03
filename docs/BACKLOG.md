@@ -12,6 +12,16 @@ Enhancements to the code-based orchestration layer. No new LLM components.
 
 ### Core Runtime
 
+#### Deterministic Audit View
+
+RunRecord `step_seq` is append order — parallel steps can finish in different orders across runs. This is fine for correctness (idempotency is by hash, not position), but makes cross-run comparison harder for auditing.
+
+**Add:** `renderAuditView(record: RunRecord)` that sorts steps deterministically (by `step_id`, then by first event timestamp) for comparison.
+
+**When to add:** If audit/comparison tooling becomes important. Not blocking for v1.
+
+---
+
 #### Per-Tool Rate Limits
 
 Base has semaphore concurrency for steps. Add per-tool rate limits for commands/search that may have stricter API limits.
@@ -200,6 +210,23 @@ finn replay --run_id X --dry-run    # check invariants only
 
 Basic replay for debugging. Eval/optimization replay is v2 (Eval Harness).
 
+#### Run Inspector
+
+Read-only view of run state for debugging and demos:
+
+```bash
+finn run show <run_id>
+```
+
+**Output:**
+- Status (RUNNING / OK / BLOCKED / FAILED)
+- Current/last step
+- Per-step retry counts
+- Links to artifacts (run record, step results, DLQ entry if failed)
+- Timestamps (started, updated, duration)
+
+**Why:** Low effort, high value for day-to-day development and clean demos. Pure read over Run Record — trivial once storage exists.
+
 #### Run Invariant Checker
 
 Lightweight validation command — proves correctness without LLM eval infrastructure.
@@ -336,7 +363,7 @@ Pure extraction, cheap and testable:
 
 #### Stage B — Curated Knowledge Extraction (LLM, optional)
 
-Judgment-based distillation into pods:
+Judgment-based distillation into lore:
 - Playbooks ("if verifier fails with X, try Y")
 - Pitfalls (gotchas tied to evidence)
 - Repo map updates
@@ -351,30 +378,46 @@ Judgment-based distillation into pods:
 **Guardrails:**
 - Output schema + max tokens
 - Must include `sources: [artifact_ids]`
-- Write to pods only if confidence ≥ threshold
+- Write to `lore` workspace only if confidence ≥ threshold
 - If LLM fails → skip, do not break the run
 
 ---
 
-### Pods (Long-Lived Knowledge)
+### Lore (Long-Lived Knowledge)
 
-Durable knowledge store. Distinct from artifacts (internal orchestration state) and capsules (external handoff to Claude Code).
+Durable knowledge extracted from runs. Uses existing ArtifactStore with `workspace: "lore"` and `ttl_seconds: null` (persistent).
 
-**Note:** Pods will be a Moss feature (`dev/pod.md`). Finn consumes pods for retrieval and writes via Finalizer.
+**No new store needed.** Same interface as other artifacts, just persistent.
 
-**Pod types:**
-- `reference_doc` — API docs, specs, papers
-- `repo_map` — stable layout + key entrypoints
-- `playbook` — if X happens, do Y
-- `pitfall` — gotchas tied to evidence
-- `workflow_notes` — what works for this repo
+**Lore types (artifact kinds):**
+- `playbook` — if X happens, do Y (structured triggers + actions)
+- `pitfall` — gotchas tied to evidence (file patterns + warnings)
+- `repo-map` — stable layout + key entrypoints (structured paths)
 
-**Retrieval (Step 0):** Before fan-out, query pods for relevant prior work:
-- Search by task keywords
+**Schema:** Lore are typed JSON (Zod-validated), not free-form text. Code operates on `data`, LLMs consume rendered `text`.
+
+```typescript
+// Example playbook
+{
+  kind: "playbook",
+  workspace: "lore",
+  data: {
+    trigger: { file_pattern: "src/auth/*", error_pattern: "token_*" },
+    action: "Check token expiry validation",
+    confidence: 0.85,
+    hit_count: 12,
+  },
+  sources: ["artifact-xyz"],  // provenance
+  ttl_seconds: null,  // persistent
+}
+```
+
+**Retrieval (Step 0):** Before fan-out, query lore for relevant prior work:
+- Filter by file patterns, error categories
 - Inject matches into subagent context
 - Ensures explorers leverage proven patterns and avoid past mistakes
 
-**Write:** Finalizer writes pods (gated + provenance).
+**Write:** Finalizer extracts lore (gated by confidence + provenance required).
 
 ---
 
@@ -388,7 +431,7 @@ External layer that improves prompts and policies using Finn traces. Finn emits 
 - Prompt variants (explorers, verifiers, stitcher, meta-supervisor)
 - Routing thresholds (retry vs replan vs ask human)
 - Stop policies (diminishing returns thresholds)
-- Retrieval policies (which pods to fetch per stage)
+- Retrieval policies (which lore to fetch per stage)
 
 **Learning signals:**
 - Verifier pass/fail        ← LLM-based (risky)
@@ -422,11 +465,11 @@ Validate prompt/policy changes before rollout. Builds on v1's basic replay. **Co
 | Run Records | Artifacts (`kind: "run-record"`) | Structured state, `run_id`/`phase`/`role` |
 | Golden marker | Tag on artifact | `tags: ["golden"]` |
 | Subagent outputs | Artifacts (per-kind schemas) | Typed JSON + rendered text |
-| Prompt variants | Pods | Free-form, may exceed 12K |
-| Eval reports | Pods | Comparison reports |
+| Prompt variants | Artifacts (`workspace: "prompts"`) | Versioned via tags, persistent |
+| Eval reports | Artifacts (`workspace: "eval"`) | Comparison results, persistent |
 
 **Replay for eval** (vs v1 replay for debug):
-- Swap prompts from pods during replay
+- Swap prompts from `prompts` workspace during replay
 - Golden runs = Run Record artifacts with `tags: ["golden"]`
 - A/B comparison across prompt variants
 
@@ -465,7 +508,7 @@ finn feat plan.md --stop-policy=default --budget-policy=default
 
 ### Cross-Project Knowledge
 
-Optional. Share patterns across codebases via global pods workspace.
+Optional. Share patterns across codebases via global lore workspace.
 
 **Requirements:**
 - Strict namespacing
@@ -513,15 +556,22 @@ Optimization Pipeline ──→ updates prompts/policies (external)
          ├── Subagents ────→ explorers, verifiers, stitcher (LLM reasoning)
          │        │
          │        ↓ retrieve
-         │      Pods ──────→ long-lived knowledge (via Moss)
+         │    Lore ───→ playbooks, pitfalls, repo-maps (persistent artifacts)
          │
-         ├── Artifact Store → internal durable state (run records, findings)
+         ├── Artifact Store → ALL internal state (ephemeral + persistent)
+         │        │
+         │        ├── runs, plan, feat, dlq (TTL-based)
+         │        ├── lore (persistent)
+         │        └── prompts, eval (persistent)
          │
          ├── Finalizer ────→ Stage A (code) + Stage B (LLM, optional)
          │        │
-         │        └───────→ writes to Pods (via Moss)
+         │        └───────→ writes to lore workspace
          │
          └── Meta-supervisor → escalation-only LLM (v2)
+
+External (optional):
+       Moss ──────────────→ Capsules for session handoffs (export on demand)
 ```
 
 ---

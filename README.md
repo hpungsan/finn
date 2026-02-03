@@ -54,8 +54,8 @@ Code-based hardening, no new LLM components.
 ### v2 — Meta Layer
 Optional components that consume traces and update Finn's inputs:
 - Meta-supervisor (escalation-only LLM for blocked states)
-- Run Finalizer (compile runs into capsules + pods)
-- Pods (long-lived knowledge via Moss)
+- Run Finalizer (extract lore from runs)
+- Lore (persistent artifacts: playbooks, pitfalls, repo-maps)
 - Optimization Pipeline (improve prompts/policies from traces)
 
 See [docs/BACKLOG.md](docs/BACKLOG.md) for details.

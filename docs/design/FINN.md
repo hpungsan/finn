@@ -21,7 +21,7 @@
 
 * **Meta-reasoning:** no LLM judgment in orchestration layer.
 * **Learned policies:** requires eval harness first.
-* **Knowledge persistence:** Pods are v2.
+* **Knowledge persistence:** Lore workspace is v2.
 * **Event-driven triggers:** webhooks/cron are v3.
 
 See [BACKLOG.md](../BACKLOG.md) for future scope.
@@ -33,10 +33,10 @@ See [BACKLOG.md](../BACKLOG.md) for future scope.
 | Type | Owner | Scope | Usage |
 |------|-------|-------|-------|
 | **Artifacts** | Finn | Internal | Explorer findings, verifier outputs, run records, DLQ entries (TTL, code operates on `data`) |
+| **Lore** | Finn | Internal | Playbooks, pitfalls, repo maps (persistent artifacts, v2) |
 | **Capsules** | Moss | External | Workflow summary, handoff exports (to Claude Code / future sessions) |
-| **Pods** | Moss | Persistent | Playbooks, pitfalls, repo maps **(v2)** |
 
-Artifacts are Finn's internal state layer. Capsules are generated on demand for external handoff via Moss.
+Artifacts are Finn's internal state layer. Lore are persistent artifacts (`workspace: "lore"`, no TTL). Capsules are generated on demand for external handoff via Moss.
 
 ---
 
@@ -93,7 +93,6 @@ Artifacts are Finn's internal state layer. Capsules are generated on demand for 
 │                          MOSS                                    │
 │                                                                  │
 │   Capsules → session handoffs for humans/LLMs                   │
-│   Pods → long-lived knowledge (v2)                              │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -231,7 +230,7 @@ Typed codes > freeform strings for Run Record analysis.
 
 ### Step Interface
 
-First-class abstraction for testable, replayable orchestration. Workflows are lists of steps; engine handles execution uniformly.
+First-class abstraction for testable, replayable orchestration. Workflows define steps; engine handles execution uniformly.
 
 ```typescript
 interface Step<T = unknown> {
@@ -240,6 +239,7 @@ interface Step<T = unknown> {
   deps: string[];           // step IDs that must complete first
   timeout: number;          // per-step timeout (ms), overrides default
   maxRetries: number;       // per-step retry limit, overrides default
+  model: string;            // model to use, e.g., "sonnet", "haiku" — included in step_instance_id
   prompt_version: string;   // required for replay correctness, e.g., "code-explorer@2"
   schema_version: string;   // required for replay correctness, e.g., "explorer-finding@1"
   run(ctx: StepContext): Promise<StepResult<T>>;
@@ -328,7 +328,7 @@ interface RunRecord {
 
 interface StepRecord {
   step_id: string;
-  step_instance_id: string;  // hash(step_id + inputs_digest + schema_version + prompt_version)
+  step_instance_id: string;  // hash(step_id + inputs_digest + model + schema_version + prompt_version)
   step_seq: number;          // monotonic order for appends
   name: string;
   status: Status;            // derived from last event
@@ -338,6 +338,7 @@ interface StepRecord {
   events: StepEvent[];       // append-only, crash-safe
   artifact_ids: string[];    // artifact IDs created by this step
   retry_count: number;
+  repair_count: number;      // successful Zod repairs (visibility into prompt quality)
   error_code?: ErrorCode;
 
   // Trace (minimal for v1)
@@ -355,7 +356,7 @@ type StepEvent =
   | { type: "OK" | "BLOCKED" | "FAILED"; at: string };
 
 // Zod repair: If output fails validation, attempt one repair call.
-// - If repair succeeds → no event logged (transparent fix)
+// - If repair succeeds → increment repair_count (no event, but visible for monitoring)
 // - If repair fails → log RETRY with error: "SCHEMA_INVALID", repair_attempt: true
 
 type Status = "PENDING" | "RUNNING" | "OK" | "RETRYING" | "BLOCKED" | "FAILED";
@@ -420,13 +421,14 @@ artifact_store({
 One rule for step-level idempotency:
 
 ```
-step_instance_id = hash(step_id + inputs_digest + schema_version + prompt_version)
+step_instance_id = hash(step_id + inputs_digest + model + schema_version + prompt_version)
 ```
 
 | Field | Source |
 |-------|--------|
 | `step_id` | Step definition |
 | `inputs_digest` | Hash of step inputs + artifact refs from deps |
+| `model` | Model used (e.g., "sonnet", "haiku") |
 | `schema_version` | Output schema version |
 | `prompt_version` | Prompt template version |
 
@@ -435,6 +437,7 @@ step_instance_id = hash(step_id + inputs_digest + schema_version + prompt_versio
 **Enables:**
 - Resume after crash (same inputs → same instance_id → skip completed)
 - Replay for debugging (deterministic)
+- Model change forces re-run (different model → new instance_id)
 - Schema change forces re-run (different schema_version → new instance_id)
 - Prompt change forces re-run (different prompt_version → new instance_id)
 
@@ -451,6 +454,11 @@ step_instance_id = hash(step_id + inputs_digest + schema_version + prompt_versio
 - Current hash = `pre_hash` → apply edit
 - Current hash ≠ both → `HUMAN_REQUIRED` (file modified externally)
 
+**Hashing specification:**
+- Algorithm: SHA-256 on raw bytes (no newline normalization)
+- Paths: canonicalized before hashing (forward slashes, no trailing slash)
+- Rationale: Raw bytes avoids platform-specific newline issues; canonical paths ensure cross-platform consistency
+
 ### Action Tracking
 
 Per-step action log for audit trail and resume correctness:
@@ -458,10 +466,10 @@ Per-step action log for audit trail and resume correctness:
 ```typescript
 interface StepAction {
   action_id: string;       // idempotency key: hash(step_id + op + path + inputs)
-  path: string;
+  path: string;            // canonicalized: forward slashes, no trailing slash
   op: "edit" | "create" | "delete" | "external";
-  pre_hash?: string;       // for edits: file hash before
-  post_hash?: string;      // for edits: file hash after
+  pre_hash?: string;       // for edits: SHA-256 of raw file bytes before
+  post_hash?: string;      // for edits: SHA-256 of raw file bytes after
   external_ref?: string;   // for external: ticket id, API response id, etc.
 }
 
@@ -796,6 +804,12 @@ finn/
 ├── src/
 │   ├── index.ts              # MCP server entry
 │   ├── server.ts             # Tool definitions
+│   ├── engine/               # Step execution harness
+│   │   ├── index.ts          # Public exports
+│   │   ├── types.ts          # Step, StepContext, StepResult, StepRecord
+│   │   ├── executor.ts       # Topo-sort, semaphore, Promise.allSettled
+│   │   ├── run-writer.ts     # Serialized RunRecord writes
+│   │   └── idempotency.ts    # step_instance_id computation
 │   ├── workflows/
 │   │   ├── plan.ts           # Plan: fan-out/fan-in/stitch
 │   │   ├── feat.ts           # Feat: design/impl/verify loops

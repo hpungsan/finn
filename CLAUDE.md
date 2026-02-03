@@ -6,6 +6,22 @@ Deterministic workflows for Claude Code via Agent SDK + MCP.
 ## Tech Stack
 TypeScript, Claude Agent SDK, MCP TypeScript SDK (@modelcontextprotocol/sdk), Moss (MCP client)
 
+## MUST READ
+
+Before working on this project, read these design documents:
+
+**Core:**
+1. `docs/design/FINN.md` — Architecture, primitives, design principles
+2. `docs/design/artifacts.md` — Artifact store interface and storage semantics
+
+**Workflows:**
+3. `docs/design/plan.md` — Plan workflow: fan-out explorers, fan-in, stitcher
+
+## Reference (as needed)
+
+- `docs/BACKLOG.md` — Future features and v1/v2/v3 scope
+- `docs/design/artifact-backlog.md` — Deferred storage features
+
 ## Key Concepts
 - **Agent SDK**: Programmatic orchestration with guaranteed parallelism, loop control, error handling
 - **MCP Server**: Exposes `finn__plan`, `finn__feat`, `finn__fix` tools to Claude Code
@@ -29,8 +45,8 @@ Finn ──→ Orchestration + State
 | Primitive | Owner | Consumer | Purpose |
 |-----------|-------|----------|---------|
 | **Artifacts** | Finn | Code | Structured JSON (`data`) + rendered view (`text`). Explorer findings, verifier outputs, run records, DLQ entries. |
+| **Lore** | Finn | Code | Persistent artifacts for playbooks, pitfalls, repo-maps (v2). |
 | **Capsules** | Moss | Humans/LLMs | 6-section markdown for session handoffs. Finn exports on demand. |
-| **Pods** | Moss | Humans/LLMs | Long-lived knowledge (v2). |
 
 ### Key Principle: Data is Truth, Text is View
 
@@ -49,11 +65,11 @@ text (markdown) ────→ derived view for LLMs, auto-generatable
 | Term | Meaning |
 |------|---------|
 | **Artifact** | Structured state for code. Has `kind`, `data`, optional `text`. |
+| **Lore** | Persistent artifacts (`workspace: "lore"`, no TTL). Playbooks, pitfalls, repo-maps (v2). |
 | **Capsule** | Markdown handoff for humans/LLMs. 6-section format. |
-| **Pod** | Long-lived knowledge (v2). |
-| **Workspace** | Namespace with TTL default (`plan/`, `feat/`, `runs/`, `dlq/`). |
+| **Workspace** | Namespace with TTL default (`plan/`, `feat/`, `runs/`, `dlq/`, `lore/`). |
 | **run_id** | Scopes artifacts to a single workflow execution. |
-| **kind** | Artifact type (`explorer-finding`, `verifier-output`, `run-record`, `dlq-entry`). |
+| **kind** | Artifact type (`explorer-finding`, `verifier-output`, `run-record`, `dlq-entry`, `playbook`, `pitfall`, `repo-map`). |
 
 ## Workflows
 
