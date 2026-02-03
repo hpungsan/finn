@@ -24,7 +24,7 @@ export interface Artifact<T = unknown> {
 
   // Lifecycle
   version: number; // optimistic concurrency (starts at 1)
-  ttl_seconds?: number; // time-to-live (null = no expiry)
+  ttl_seconds?: number; // time-to-live (undefined = no expiry)
   expires_at?: number; // computed: created_at + ttl_seconds (ms)
   created_at: number; // Unix timestamp (ms)
   updated_at: number; // Unix timestamp (ms)
@@ -85,7 +85,7 @@ export type ListOpts = {
  * items includes data but excludes text for efficiency.
  */
 export type ListResult = {
-  items: Artifact[]; // includes data, excludes text
+  items: Omit<Artifact, "text">[]; // data only, no text
   pagination: {
     limit: number;
     offset: number;
