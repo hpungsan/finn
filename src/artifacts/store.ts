@@ -1,12 +1,12 @@
 import type {
   Artifact,
-  StoreOpts,
-  FetchOpts,
-  ListOpts,
-  ListResult,
   ComposeOpts,
   ComposeResult,
   DeleteOpts,
+  FetchOpts,
+  ListOpts,
+  ListResult,
+  StoreOpts,
 } from "./types.js";
 
 /**

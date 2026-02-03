@@ -86,9 +86,12 @@ text (markdown) ────→ derived view for LLMs, auto-generatable
 ```bash
 npm install          # Install dependencies
 npm run build        # Compile TypeScript
-npm run dev          # Development mode
+npm run dev          # Development mode (watch)
 npm test             # Run tests
-npm run lint         # Lint code
+npm run fmt          # Auto-fix format + lint (Biome)
+npm run lint         # Check format + lint (no fix)
+npm run typecheck    # Type check only
+npm run check        # lint + typecheck (CI)
 ```
 
 ## Project Structure

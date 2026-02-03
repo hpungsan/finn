@@ -4,31 +4,31 @@
  */
 export interface Artifact<T = unknown> {
   // Identity
-  id: string;                    // ULID, auto-generated
-  workspace: string;             // namespace as provided (default: "default")
-  workspace_norm: string;        // normalized for uniqueness/lookup
-  name?: string;                 // unique handle as provided
-  name_norm?: string;            // normalized for uniqueness/lookup
+  id: string; // ULID, auto-generated
+  workspace: string; // namespace as provided (default: "default")
+  workspace_norm: string; // normalized for uniqueness/lookup
+  name?: string; // unique handle as provided
+  name_norm?: string; // normalized for uniqueness/lookup
 
   // Content
-  kind: string;                  // artifact type (e.g., "run-record", "explorer-finding")
-  data: T;                       // structured JSON (validated by caller)
-  text?: string;                 // rendered view for LLMs (provided by caller)
+  kind: string; // artifact type (e.g., "run-record", "explorer-finding")
+  data: T; // structured JSON (validated by caller)
+  text?: string; // rendered view for LLMs (provided by caller)
 
   // Orchestration
-  run_id?: string;               // groups artifacts for one workflow run
-  phase?: string;                // workflow stage
-  role?: string;                 // agent role
-  tags?: string[];               // categorization
-  schema_version?: string;       // content schema version (e.g., "explorer-finding@1")
+  run_id?: string; // groups artifacts for one workflow run
+  phase?: string; // workflow stage
+  role?: string; // agent role
+  tags?: string[]; // categorization
+  schema_version?: string; // content schema version (e.g., "explorer-finding@1")
 
   // Lifecycle
-  version: number;               // optimistic concurrency (starts at 1)
-  ttl_seconds?: number;          // time-to-live (null = no expiry)
-  expires_at?: number;           // computed: created_at + ttl_seconds (ms)
-  created_at: number;            // Unix timestamp (ms)
-  updated_at: number;            // Unix timestamp (ms)
-  deleted_at?: number;           // soft delete timestamp (ms)
+  version: number; // optimistic concurrency (starts at 1)
+  ttl_seconds?: number; // time-to-live (null = no expiry)
+  expires_at?: number; // computed: created_at + ttl_seconds (ms)
+  created_at: number; // Unix timestamp (ms)
+  updated_at: number; // Unix timestamp (ms)
+  deleted_at?: number; // soft delete timestamp (ms)
 }
 
 /**
@@ -37,19 +37,19 @@ export interface Artifact<T = unknown> {
  * - mode: "error" (default) fails on name collision, "replace" overwrites
  */
 export type StoreOpts = {
-  workspace?: string;            // default: "default"
-  name?: string;                 // unique handle (optional)
-  kind: string;                  // required
-  data: unknown;                 // required (caller validates before calling)
-  text?: string;                 // optional rendered view
+  workspace?: string; // default: "default"
+  name?: string; // unique handle (optional)
+  kind: string; // required
+  data: unknown; // required (caller validates before calling)
+  text?: string; // optional rendered view
   run_id?: string;
   phase?: string;
   role?: string;
   tags?: string[];
   schema_version?: string;
-  ttl_seconds?: number | null;   // null = no expiry
-  expected_version?: number;     // optimistic locking
-  mode?: "error" | "replace";    // default: "error"
+  ttl_seconds?: number | null; // null = no expiry
+  expected_version?: number; // optimistic locking
+  mode?: "error" | "replace"; // default: "error"
 };
 
 /**
@@ -57,8 +57,8 @@ export type StoreOpts = {
  * Address by id OR (workspace + name) - not both.
  */
 export type FetchOpts = {
-  id?: string;                   // by ID
-  workspace?: string;            // by name (requires workspace)
+  id?: string; // by ID
+  workspace?: string; // by name (requires workspace)
   name?: string;
   include_expired?: boolean;
   include_deleted?: boolean;
@@ -75,8 +75,8 @@ export type ListOpts = {
   role?: string;
   include_expired?: boolean;
   include_deleted?: boolean;
-  order_by?: "created_at" | "updated_at";  // default: "updated_at", always with id tie-breaker
-  limit?: number;                // default: 50, max: 100
+  order_by?: "created_at" | "updated_at"; // default: "updated_at", always with id tie-breaker
+  limit?: number; // default: 50, max: 100
   offset?: number;
 };
 
@@ -85,7 +85,7 @@ export type ListOpts = {
  * items includes data but excludes text for efficiency.
  */
 export type ListResult = {
-  items: Artifact[];             // includes data, excludes text
+  items: Artifact[]; // includes data, excludes text
   pagination: {
     limit: number;
     offset: number;
@@ -108,7 +108,7 @@ export type ArtifactRef = {
  */
 export type ComposeOpts = {
   items: ArtifactRef[];
-  format?: "markdown" | "json";  // default: "markdown"
+  format?: "markdown" | "json"; // default: "markdown"
 };
 
 /**
@@ -118,7 +118,10 @@ export type ComposeOpts = {
  */
 export type ComposeResult =
   | { format: "markdown"; bundle_text: string }
-  | { format: "json"; parts: Array<{ id: string; name?: string; data: unknown }> };
+  | {
+      format: "json";
+      parts: Array<{ id: string; name?: string; data: unknown }>;
+    };
 
 /**
  * Options for deleting an artifact.
