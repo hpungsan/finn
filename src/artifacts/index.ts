@@ -6,7 +6,8 @@ export type { ErrorCode } from "./errors.js";
 export { ArtifactError } from "./errors.js";
 // Utilities
 export { normalize } from "./normalize.js";
-
+// Implementations
+export { SqliteArtifactStore } from "./sqlite.js";
 // Interface
 export type { ArtifactStore } from "./store.js";
 export type {

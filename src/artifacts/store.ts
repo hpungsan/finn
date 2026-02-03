@@ -11,7 +11,7 @@ import type {
 
 /**
  * Interface for artifact storage operations.
- * Implementations: SqliteArtifactStore (production), InMemoryArtifactStore (tests)
+ * Implementation: SqliteArtifactStore (use :memory: for tests)
  */
 export interface ArtifactStore {
   /**
