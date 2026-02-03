@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { normalize } from "./normalize.js";
+import { normalize } from "../normalize.js";
 
 describe("normalize", () => {
   test("trims leading/trailing whitespace", () => {
