@@ -10,12 +10,15 @@ TypeScript, Claude Agent SDK, MCP TypeScript SDK (@modelcontextprotocol/sdk), Mo
 
 Before working on this project, read these design documents:
 
+**Build Order (active):**
+1. `dev/BUILD.md` — Current build phases and stages (gitignored, follow this)
+
 **Core:**
-1. `docs/design/FINN.md` — Architecture, primitives, design principles
-2. `docs/design/artifacts.md` — Artifact store interface and storage semantics
+2. `docs/design/FINN.md` — Architecture, primitives, design principles
+3. `docs/design/artifacts.md` — Artifact store interface and storage semantics
 
 **Workflows:**
-3. `docs/design/plan.md` — Plan workflow: fan-out explorers, fan-in, stitcher
+4. `docs/design/plan.md` — Plan workflow: fan-out explorers, fan-in, stitcher
 
 ## Reference (as needed)
 

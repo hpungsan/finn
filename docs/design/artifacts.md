@@ -34,6 +34,8 @@ finn/src/ (domain layer)
 
 ## Library API
 
+> **Source of truth:** `src/artifacts/`. Duplicated here for standalone reference.
+
 ### ArtifactStore Interface
 
 ```typescript
@@ -52,17 +54,6 @@ interface ArtifactStore {
 |----------------|----------|
 | `SqliteArtifactStore` | Production — persistent storage |
 | `InMemoryArtifactStore` | Tests — no external dependencies |
-
-```typescript
-import { SqliteArtifactStore } from "./artifacts/sqlite";
-import { InMemoryArtifactStore } from "./artifacts/memory";
-
-// Production
-const store = new SqliteArtifactStore({ dbPath: "~/.finn/artifacts.db" });
-
-// Tests
-const store = new InMemoryArtifactStore();
-```
 
 ---
 
@@ -94,10 +85,10 @@ interface Artifact<T = unknown> {
   // Lifecycle
   version: number;               // optimistic concurrency (starts at 1)
   ttl_seconds?: number;          // time-to-live (null = no expiry)
-  expires_at?: number;           // computed: created_at + ttl_seconds
+  expires_at?: number;           // computed: created_at + ttl_seconds (ms)
   created_at: number;            // Unix timestamp (ms)
-  updated_at: number;
-  deleted_at?: number;           // soft delete
+  updated_at: number;            // Unix timestamp (ms)
+  deleted_at?: number;           // soft delete timestamp (ms)
 }
 ```
 
@@ -114,6 +105,7 @@ type StoreOpts = {
   phase?: string;
   role?: string;
   tags?: string[];
+  schema_version?: string;
   ttl_seconds?: number | null;   // null = no expiry
   expected_version?: number;     // optimistic locking
   mode?: "error" | "replace";    // default: "error"
@@ -142,17 +134,27 @@ type ListOpts = {
 
 type ListResult = {
   items: Artifact[];             // includes data, excludes text
-  pagination: { limit: number; offset: number; has_more: boolean };
+  pagination: {
+    limit: number;
+    offset: number;
+    has_more: boolean;
+  };
+};
+
+type ArtifactRef = {
+  id?: string;
+  workspace?: string;
+  name?: string;
 };
 
 type ComposeOpts = {
-  items: Array<{ id?: string; workspace?: string; name?: string }>;
+  items: ArtifactRef[];
   format?: "markdown" | "json";  // default: "markdown"
 };
 
 type ComposeResult =
-  | { bundle_text: string }                                    // markdown (requires text)
-  | { parts: Array<{ id: string; name?: string; data: unknown }> };  // json (data only)
+  | { format: "markdown"; bundle_text: string }
+  | { format: "json"; parts: Array<{ id: string; name?: string; data: unknown }> };
 
 type DeleteOpts = {
   id?: string;
@@ -174,8 +176,6 @@ Artifacts use raw + normalized addressing to prevent collisions while preserving
 2. Lowercase
 3. Collapse internal whitespace to single spaces
 4. Preserve all other characters (underscores, hyphens, etc.)
-
-No character translation: `my-name` stays `my-name`, `my_name` stays `my_name`.
 
 ```
 "  My Workspace  " → "my workspace"
@@ -299,6 +299,8 @@ Bundles artifact text views into single context for LLM consumption.
 
 ## Error Codes
 
+Operations throw `ArtifactError` with a `code` property for typed error handling.
+
 | Code | Cause |
 |------|-------|
 | `VERSION_MISMATCH` | `expected_version` doesn't match current |
@@ -308,19 +310,7 @@ Bundles artifact text views into single context for LLM consumption.
 | `AMBIGUOUS_ADDRESSING` | Both `id` AND `workspace + name` provided |
 | `DATA_TOO_LARGE` | `data` exceeds 200K chars (ceiling; Finn enforces kind-specific limits) |
 | `TEXT_TOO_LARGE` | `text` exceeds 12K chars |
-| `COMPOSE_MISSING_TEXT` | Artifact in items has no `text` |
-
-```typescript
-import { ArtifactError, ErrorCode } from "./artifacts/errors";
-
-try {
-  await store.store({ ... });
-} catch (e) {
-  if (e instanceof ArtifactError && e.code === "VERSION_MISMATCH") {
-    // Handle conflict
-  }
-}
-```
+| `COMPOSE_MISSING_TEXT` | Artifact in items has no `text` (markdown format) |
 
 ---
 
@@ -468,39 +458,6 @@ const prev = await store.fetch({
   name: `${run_id}-verifier-r1`,
 });
 const resolved = prev.data.issues.filter(i => !currentIssues.has(i.id));
-```
-
----
-
-## Project Structure
-
-```
-finn/
-├── src/
-│   ├── artifacts/
-│   │   ├── index.ts              # Public exports
-│   │   ├── types.ts              # Artifact, StoreOpts, etc.
-│   │   ├── errors.ts             # ArtifactError, ErrorCode
-│   │   ├── store.ts              # ArtifactStore interface
-│   │   ├── sqlite.ts             # SqliteArtifactStore
-│   │   ├── memory.ts             # InMemoryArtifactStore
-│   │   ├── normalize.ts          # Name/workspace normalization
-│   │   └── schema.sql            # SQLite schema
-│   ├── schemas/                  # Zod schemas for artifact kinds
-│   │   ├── explorer-finding.ts
-│   │   ├── verifier-output.ts
-│   │   ├── run-record.ts
-│   │   └── dlq-entry.ts
-│   ├── policies/
-│   │   └── ttl.ts                # TTL constants per workspace/kind
-│   ├── renderers/
-│   │   ├── explorer.ts           # renderExplorerFinding()
-│   │   ├── verifier.ts           # renderVerifierOutput()
-│   │   └── index.ts
-│   └── workflows/
-│       ├── plan.ts
-│       ├── feat.ts
-│       └── fix.ts
 ```
 
 ---
