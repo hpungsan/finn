@@ -47,15 +47,18 @@ export async function storeArtifact(
   store: ArtifactStore,
   opts: StoreArtifactOpts,
 ) {
-  // Require numeric TTL for run durability artifacts (never permanent)
-  if (
-    REQUIRES_NUMERIC_TTL.includes(opts.kind) &&
-    typeof opts.ttl_seconds !== "number"
-  ) {
-    throw new ArtifactError(
-      "INVALID_REQUEST",
-      `${opts.kind} requires numeric ttl_seconds (use getRunRecordTtl())`,
-    );
+  // Require positive finite TTL for run durability artifacts (never permanent)
+  if (REQUIRES_NUMERIC_TTL.includes(opts.kind)) {
+    if (
+      typeof opts.ttl_seconds !== "number" ||
+      !Number.isFinite(opts.ttl_seconds) ||
+      opts.ttl_seconds <= 0
+    ) {
+      throw new ArtifactError(
+        "INVALID_REQUEST",
+        `${opts.kind} requires positive finite ttl_seconds (use getRunRecordTtl())`,
+      );
+    }
   }
 
   // Validate kind-specific size limits

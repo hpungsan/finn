@@ -178,6 +178,50 @@ describe("TTL policies", () => {
 
       expect(artifact.ttl_seconds).toBe(TTL.RUN_FAILURE);
     });
+
+    test("rejects NaN ttl_seconds", async () => {
+      await expect(
+        storeArtifact(store, {
+          workspace: "runs",
+          kind: "run-record",
+          data: {},
+          ttl_seconds: NaN,
+        }),
+      ).rejects.toThrow(ArtifactError);
+    });
+
+    test("rejects Infinity ttl_seconds", async () => {
+      await expect(
+        storeArtifact(store, {
+          workspace: "runs",
+          kind: "run-record",
+          data: {},
+          ttl_seconds: Infinity,
+        }),
+      ).rejects.toThrow(ArtifactError);
+    });
+
+    test("rejects negative ttl_seconds", async () => {
+      await expect(
+        storeArtifact(store, {
+          workspace: "runs",
+          kind: "run-record",
+          data: {},
+          ttl_seconds: -1,
+        }),
+      ).rejects.toThrow(ArtifactError);
+    });
+
+    test("rejects zero ttl_seconds", async () => {
+      await expect(
+        storeArtifact(store, {
+          workspace: "runs",
+          kind: "run-record",
+          data: {},
+          ttl_seconds: 0,
+        }),
+      ).rejects.toThrow(ArtifactError);
+    });
   });
 
   describe("size limits", () => {

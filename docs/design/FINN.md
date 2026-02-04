@@ -241,7 +241,7 @@ interface Step<T = unknown> {
   model: string;            // model to use, e.g., "sonnet", "haiku" — included in step_instance_id
   prompt_version: string;   // required for replay correctness, e.g., "code-explorer@2"
   schema_version: string;   // required for replay correctness, e.g., "explorer-finding@1"
-  run(ctx: StepContext): Promise<StepResult<T>>;
+  run(ctx: StepContext): Promise<StepRunnerResult>;
 }
 
 interface StepContext {
@@ -572,7 +572,7 @@ The artifact store provides the mechanism (`ttl_seconds` on store). Finn owns th
 - `ttl_seconds: undefined` → use workspace default
 - `ttl_seconds: null` → explicit no expiry (pass through)
 - `ttl_seconds: number` → use as-is
-- `run-record` and `step-result` require numeric `ttl_seconds` (use `getRunRecordTtl()`) — permanent runs not allowed
+- `run-record` and `step-result` require positive finite `ttl_seconds` (use `getRunRecordTtl()`) — permanent runs not allowed
 
 ### Size Limits
 
@@ -799,7 +799,7 @@ finn/
 │   ├── server.ts             # Tool definitions
 │   ├── engine/               # Step execution harness
 │   │   ├── index.ts          # Public exports
-│   │   ├── types.ts          # Step, StepContext, StepResult, StepRecord
+│   │   ├── types.ts          # Step, StepContext, StepRunnerResult, StepRecord
 │   │   ├── executor.ts       # Topo-sort, semaphore, Promise.allSettled
 │   │   ├── run-writer.ts     # Serialized RunRecord writes
 │   │   └── idempotency.ts    # step_instance_id computation
