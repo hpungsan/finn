@@ -34,57 +34,66 @@ const StepEventSchema = z.discriminatedUnion("type", [
 ]);
 
 // Exported for reuse in step-result.ts
-export const StepActionSchema = z.object({
-  action_id: z.string(),
-  path: z.string(),
-  op: z.enum(["edit", "create", "delete", "external"]),
-  pre_hash: z.string().optional(),
-  post_hash: z.string().optional(),
-  external_ref: z.string().optional(),
-});
+export const StepActionSchema = z
+  .object({
+    action_id: z.string(),
+    path: z.string(),
+    op: z.enum(["edit", "create", "delete", "external"]),
+    pre_hash: z.string().optional(),
+    post_hash: z.string().optional(),
+    external_ref: z.string().optional(),
+  })
+  .strict();
 
-const StepRecordSchema = z.object({
-  step_id: z.string(),
-  step_instance_id: z.string(),
-  step_seq: z.number(),
-  name: z.string(),
-  status: StatusSchema,
-  inputs_digest: z.string(),
-  schema_version: z.string(),
-  events: z.array(StepEventSchema),
-  artifact_ids: z.array(z.string()),
-  actions: z.array(StepActionSchema).optional(),
-  retry_count: z.number(),
-  repair_count: z.number(),
-  error_code: ErrorCodeSchema.optional(),
-  trace: z
-    .object({
-      model: z.string(),
-      prompt_version: z.string(),
-      inputs_digest: z.string(),
-      artifact_ids_read: z.array(z.string()),
-    })
-    .optional(),
-});
+const StepRecordSchema = z
+  .object({
+    step_id: z.string(),
+    step_instance_id: z.string(),
+    step_seq: z.number(),
+    name: z.string(),
+    status: StatusSchema,
+    inputs_digest: z.string(),
+    schema_version: z.string(),
+    events: z.array(StepEventSchema),
+    artifact_ids: z.array(z.string()),
+    actions: z.array(StepActionSchema).optional(),
+    retry_count: z.number(),
+    repair_count: z.number(),
+    error_code: ErrorCodeSchema.optional(),
+    trace: z
+      .object({
+        model: z.string(),
+        prompt_version: z.string(),
+        inputs_digest: z.string(),
+        artifact_ids_read: z.array(z.string()),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
 
-export const RunRecordSchema = z.object({
-  run_id: z.string(),
-  owner_id: z.string(),
-  status: z.enum(["RUNNING", "OK", "BLOCKED", "FAILED"]),
-  workflow: z.enum(["plan", "feat", "fix"]),
-  args: z.record(z.string(), z.unknown()),
-  repo_hash: z.string(),
-  config: z.object({
-    rounds: z.number(),
-    retries: z.number(),
-    timeout_ms: z.number(),
-  }),
-  steps: z.array(StepRecordSchema),
-  created_at: z.string(),
-  updated_at: z.string(),
-  last_error: ErrorCodeSchema.optional(),
-  resume_from: z.string().optional(),
-});
+export const RunRecordSchema = z
+  .object({
+    run_id: z.string(),
+    owner_id: z.string(),
+    status: z.enum(["RUNNING", "OK", "BLOCKED", "FAILED"]),
+    workflow: z.enum(["plan", "feat", "fix"]),
+    args: z.record(z.string(), z.unknown()),
+    repo_hash: z.string(),
+    config: z
+      .object({
+        rounds: z.number(),
+        retries: z.number(),
+        timeout_ms: z.number(),
+      })
+      .strict(),
+    steps: z.array(StepRecordSchema),
+    created_at: z.string(),
+    updated_at: z.string(),
+    last_error: ErrorCodeSchema.optional(),
+    resume_from: z.string().optional(),
+  })
+  .strict();
 
 export type RunRecord = z.infer<typeof RunRecordSchema>;
 export type StepRecord = z.infer<typeof StepRecordSchema>;

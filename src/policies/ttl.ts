@@ -1,4 +1,8 @@
-import type { ArtifactStore, StoreOpts } from "../artifacts/index.js";
+import {
+  ArtifactError,
+  type ArtifactStore,
+  type StoreOpts,
+} from "../artifacts/index.js";
 
 /** TTL constants in seconds */
 export const TTL = {
@@ -39,6 +43,16 @@ export async function storeArtifact(
   store: ArtifactStore,
   opts: StoreArtifactOpts,
 ) {
+  // Validate kind-specific size limits
+  const dataJson = JSON.stringify(opts.data);
+  const limit = KIND_SIZE_LIMITS[opts.kind] ?? KIND_SIZE_LIMITS.default;
+  if (dataJson.length > limit) {
+    throw new ArtifactError(
+      "DATA_TOO_LARGE",
+      `${opts.kind} data exceeds ${limit} chars (got ${dataJson.length})`,
+    );
+  }
+
   const workspace = opts.workspace ?? "default";
 
   // Important: distinguish undefined (use default) from null (explicit no expiry)

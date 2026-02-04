@@ -360,13 +360,6 @@ type StepEvent =
 
 type Status = "PENDING" | "RUNNING" | "OK" | "RETRYING" | "BLOCKED" | "FAILED";
 
-// Canonical return type from step runners
-type StepResult =
-  | { status: "OK"; artifact_ids: string[] }
-  | { status: "RETRY"; error: ErrorCode }
-  | { status: "BLOCKED"; error: ErrorCode; note?: string }
-  | { status: "FAILED"; error: ErrorCode; note?: string };
-
 type ErrorCode =
   | "TIMEOUT"
   | "SCHEMA_INVALID"
@@ -376,6 +369,20 @@ type ErrorCode =
   | "THRASHING"
   | "HUMAN_REQUIRED";
 ```
+
+**Step Result Types:**
+
+| Type | Status | Fields | Purpose |
+|------|--------|--------|---------|
+| `StepRunnerResult` | OK | `artifact_ids`, `actions?` | Runner succeeded |
+| | RETRY | `error` | Retry with backoff (not persisted) |
+| | BLOCKED | `artifact_ids`, `actions?`, `error`, `note?` | Needs human intervention |
+| | FAILED | `artifact_ids`, `actions?`, `error`, `note?` | Unrecoverable failure |
+| `PersistedStepResult` | OK | `artifact_ids`, `actions?` | Terminal: success |
+| | BLOCKED | `artifact_ids`, `actions?`, `error`, `note?` | Terminal: blocked |
+| | FAILED | `artifact_ids`, `actions?`, `error`, `note?` | Terminal: failed |
+
+RETRY is internal to the engine loop — only terminal states are persisted as `kind:"step-result"` artifacts.
 
 **Event sourcing:** `events` is the source of truth. `status` and `retry_count` are derived on load by folding events. This ensures crash recovery correctness — no stale cached state.
 

@@ -14,4 +14,9 @@ export {
   type StepEvent,
   type StepRecord,
 } from "./run-record.js";
-export { type StepResult, StepResultSchema } from "./step-result.js";
+export {
+  type PersistedStepResult,
+  PersistedStepResultSchema,
+  type StepRunnerResult,
+  StepRunnerResultSchema,
+} from "./step-result.js";
