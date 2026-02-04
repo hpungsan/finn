@@ -167,36 +167,20 @@ This isolates "execution mess" from planning/synthesis agents.
 
 ### Structured Output (Zod Schemas)
 
-Machine-checkable gating, not markdown regex:
+Machine-checkable gating, not markdown regex.
 
-```typescript
-// Schema per subagent type
-const ExplorerOutputSchema = z.object({
-  files: z.array(z.object({
-    path: z.string(),
-    relevance: z.enum(["high", "medium", "low"]),
-    summary: z.string(),
-  })),
-  patterns: z.array(z.string()),
-  concerns: z.array(z.string()),
-  confidence: z.number().min(0).max(1),
-});
+**Invariant:** Subagents output JSON → Zod validates → repair retry on failure → store as artifact (`data` + rendered `text`).
 
-// Validation + repair retry
-const result = await subagent.run({ ... });
-const parsed = ExplorerOutputSchema.safeParse(result);
+**Validation flow:**
+1. Subagent returns JSON
+2. Validate against schema (e.g., `ExplorerFindingSchema.safeParse()`)
+3. If invalid: one repair retry (ask agent to fix output with error details)
+4. If still invalid: `BLOCKED` with `SCHEMA_INVALID` error
 
-if (!parsed.success) {
-  // Repair retry: ask agent to fix output
-  const repaired = await subagent.run({ repair: true, errors: parsed.error });
-  const reParsed = ExplorerOutputSchema.safeParse(repaired);
-  if (!reParsed.success) {
-    return { status: "BLOCKED", reason: "invalid_output" };
-  }
-}
-```
-
-**Pattern:** Subagents output JSON → Zod validates → store as artifact (`data` + rendered `text`).
+**Canonical implementations:**
+- `src/schemas/explorer-finding.ts` — `ExplorerFindingSchema`
+- `src/schemas/run-record.ts` — `RunRecordSchema`, `ErrorCodeSchema`, `StatusSchema`
+- `src/schemas/step-result.ts` — `StepRunnerResultSchema`, `PersistedStepResultSchema`
 
 ### Timeout + Retry Policy
 
@@ -231,26 +215,36 @@ Typed codes > freeform strings for Run Record analysis.
 
 First-class abstraction for testable, replayable orchestration. Workflows define steps; engine handles execution uniformly.
 
-```typescript
-interface Step<T = unknown> {
-  id: string;
-  name: string;
-  deps: string[];           // step IDs that must complete first
-  timeout: number;          // per-step timeout (ms), overrides default
-  maxRetries: number;       // per-step retry limit, overrides default
-  model: string;            // model to use, e.g., "sonnet", "haiku" — included in step_instance_id
-  prompt_version: string;   // required for replay correctness, e.g., "code-explorer@2"
-  schema_version: string;   // required for replay correctness, e.g., "explorer-finding@1"
-  run(ctx: StepContext): Promise<StepRunnerResult>;
-}
+**Step fields:**
 
-interface StepContext {
-  run_id: string;
-  store: ArtifactStore;
-  config: RunConfig;
-  artifacts: Map<string, unknown>;  // outputs from completed deps
-}
-```
+| Field | Purpose |
+|-------|---------|
+| `id` | Unique identifier for idempotency |
+| `name` | Human-readable name |
+| `deps` | Step IDs that must complete first (for topo-sort) |
+| `timeout` | Per-step timeout (ms), overrides default |
+| `maxRetries` | Per-step retry limit, overrides default |
+| `model` | Model to use (e.g., "sonnet") — included in `step_instance_id` |
+| `prompt_version` | Prompt template version (e.g., "code-explorer@2") — included in `step_instance_id` |
+| `schema_version` | Output schema version (e.g., "explorer-finding@1") — included in `step_instance_id` |
+| `getInputs(ctx)` | Pure function returning `StepInputs` for idempotency computation |
+| `run(ctx)` | Execute the step, returns `StepRunnerResult` |
+
+**StepContext fields:**
+
+| Field | Purpose |
+|-------|---------|
+| `run_id` | Current workflow run identifier |
+| `store` | Artifact store for persistence |
+| `config` | Run configuration (rounds, retries, timeout_ms) |
+| `artifacts` | Outputs from completed deps (`Map<string, unknown>`) |
+| `repo_hash` | Repository state for steps to include in inputs |
+
+**Why `getInputs()`:** Steps own their input computation. Enables testing input canonicalization without running LLMs.
+
+**Canonical implementation:** `src/engine/types.ts` — `Step`, `StepContext`, `StepInputs`, `RunConfig`, `ArtifactInputRef`, `StepVersioning`
+
+**Domain types:** `src/schemas/run-record.ts` (`StepRecord`, `RunRecord`) and `src/schemas/step-result.ts` (`StepRunnerResult`, `PersistedStepResult`)
 
 **Engine responsibilities:**
 - Resolve `deps` → topological sort, parallel when independent
@@ -297,7 +291,9 @@ This makes crash recovery provably correct: step-result artifact is atomic proof
 - Sort artifact refs by `(workspace, name ?? id)`
 - Sort file lists alphabetically
 - Normalize paths (forward slashes, no trailing slash)
-- Use `fast-json-stable-stringify` for deterministic serialization (sorted keys, recursive)
+- Deterministic JSON serialization with sorted keys (recursive)
+
+**Canonical implementation:** `src/engine/idempotency.ts` — `computeStepInstanceId`, `computeInputsDigest`, `canonicalizeInputs`, `normalizePath`, `stableStringify`
 
 ### Run Record
 
@@ -305,70 +301,42 @@ Single source of truth for workflow execution. Scripts → platform.
 
 **v1 invariant:** A run is owned by a single Finn process. Concurrent ownership is unsupported. On RunRecord update, check `owner_id` matches → fail fast on mismatch with error: "Run owned by another process."
 
-```typescript
-interface RunRecord {
-  run_id: string;
-  owner_id: string;     // random UUID generated on Finn process startup
-  status: "RUNNING" | "OK" | "BLOCKED" | "FAILED";
-  workflow: "plan" | "feat" | "fix";
-  args: WorkflowArgs;
-  repo_hash: string;    // starting repo identity (git commit or tree hash)
+**RunRecord fields:**
 
-  // Config snapshot for replay correctness
-  config: { rounds: number; retries: number; timeout_ms: number };
+| Field | Purpose |
+|-------|---------|
+| `run_id` | Unique run identifier |
+| `owner_id` | Process ownership (UUID generated on Finn startup) |
+| `status` | RUNNING, OK, BLOCKED, FAILED |
+| `workflow` | plan, feat, fix |
+| `args` | Workflow arguments |
+| `repo_hash` | Starting repo identity (git commit or tree hash) |
+| `config` | Snapshot: rounds, retries, timeout_ms |
+| `steps` | StepRecord array, ordered by step_seq |
+| `created_at` / `updated_at` | ISO timestamps |
+| `last_error` | ErrorCode if failed |
+| `resume_from` | step_id for resume |
 
-  steps: StepRecord[];  // ordered by step_seq
+**StepRecord fields:**
 
-  created_at: string;   // ISO timestamp
-  updated_at: string;
-  last_error?: ErrorCode;
-  resume_from?: string;  // step_id to resume
-}
+| Field | Purpose |
+|-------|---------|
+| `step_id` | Step definition identifier |
+| `step_instance_id` | Idempotency key (hash of inputs + versioning) |
+| `step_seq` | Monotonic order for appends |
+| `inputs_digest` | Hash of canonicalized inputs |
+| `events` | Append-only event log (source of truth) |
+| `artifact_ids` | Artifacts created by this step |
+| `retry_count` / `repair_count` | Counters (derived from events) |
+| `trace` | Model, prompt_version, artifact_ids_read |
 
-interface StepRecord {
-  step_id: string;
-  step_instance_id: string;  // hash(step_id + inputs_digest + model + schema_version + prompt_version)
-  step_seq: number;          // monotonic order for appends
-  name: string;
-  status: Status;            // derived from last event
+**Event types:** STARTED, RETRY (with error + repair_attempt flag), OK, BLOCKED, FAILED
 
-  inputs_digest: string;     // hash of step inputs + artifact refs (canonicalized)
-  schema_version: string;    // output schema version
-  events: StepEvent[];       // append-only, crash-safe
-  artifact_ids: string[];    // artifact IDs created by this step
-  retry_count: number;
-  repair_count: number;      // successful Zod repairs (visibility into prompt quality)
-  error_code?: ErrorCode;
+**Status values:** PENDING, RUNNING, OK, RETRYING, BLOCKED, FAILED
 
-  // Trace (minimal for v1)
-  trace?: {
-    model: string;
-    prompt_version: string;
-    inputs_digest: string;
-    artifact_ids_read: string[];  // artifacts consumed by this step
-  };
-}
+**Zod repair:** If output fails validation, attempt one repair call. If repair succeeds → increment `repair_count`. If repair fails → RETRY event with `SCHEMA_INVALID` error.
 
-type StepEvent =
-  | { type: "STARTED"; at: string }
-  | { type: "RETRY"; at: string; error: ErrorCode; repair_attempt?: boolean }
-  | { type: "OK" | "BLOCKED" | "FAILED"; at: string };
-
-// Zod repair: If output fails validation, attempt one repair call.
-// - If repair succeeds → increment repair_count (no event, but visible for monitoring)
-// - If repair fails → log RETRY with error: "SCHEMA_INVALID", repair_attempt: true
-
-type Status = "PENDING" | "RUNNING" | "OK" | "RETRYING" | "BLOCKED" | "FAILED";
-
-type ErrorCode =
-  | "TIMEOUT"
-  | "SCHEMA_INVALID"
-  | "TOOL_ERROR_TRANSIENT"   // network, 429, timeouts → retry with backoff
-  | "TOOL_ERROR_PERMANENT"   // permission denied, invalid args → fail fast
-  | "RATE_LIMIT"
-  | "THRASHING"
-  | "HUMAN_REQUIRED";
-```
+**Canonical implementation:** `src/schemas/run-record.ts` — `RunRecordSchema`, `ErrorCodeSchema`, `StatusSchema`
 
 **Step Result Types:**
 
@@ -384,6 +352,8 @@ type ErrorCode =
 
 RETRY is internal to the engine loop — only terminal states are persisted as `kind:"step-result"` artifacts.
 
+**Canonical implementation:** `src/schemas/step-result.ts` — `StepRunnerResultSchema`, `PersistedStepResultSchema`
+
 **Event sourcing:** `events` is the source of truth. `status` and `retry_count` are derived on load by folding events. This ensures crash recovery correctness — no stale cached state.
 
 **Enables:**
@@ -393,30 +363,14 @@ RETRY is internal to the engine loop — only terminal states are persisted as `
 - Audit trail
 
 **Persisted via ArtifactStore:**
-```typescript
-// Initial create
-artifact_store({
-  workspace: "runs",
-  name: run_id,
-  kind: "run-record",
-  data: runRecord,
-  ttl_seconds: 7 * 24 * 3600,  // 7 days (updated on completion)
-});
 
-// Update (optimistic locking + true replace)
-const current = await artifact_fetch({ workspace: "runs", name: run_id });
-artifact_store({
-  workspace: current.workspace,
-  name: current.name,
-  kind: current.kind,
-  data: updatedRunRecord,
-  run_id: current.run_id,
-  expected_version: current.version,
-  ttl_seconds: updatedRunRecord.status === "OK"
-    ? 7 * 24 * 3600    // 7 days for success
-    : 30 * 24 * 3600,  // 30 days for failure
-});
-```
+RunRecords are stored as artifacts in `workspace: "runs"` with TTL based on outcome:
+- Success (OK): 7 days
+- Failure (BLOCKED/FAILED): 30 days
+
+Use `storeArtifact()` wrapper which enforces TTL policy. Updates use optimistic locking via `expected_version`.
+
+**Canonical implementation:** `src/policies/ttl.ts` — `storeArtifact`, `getRunRecordTtl`
 
 **Optimistic concurrency:** `expected_version` implies update — store rejects if version doesn't match or artifact not found. No race window between read and write.
 
@@ -467,25 +421,24 @@ step_instance_id = hash(step_id + inputs_digest + model + schema_version + promp
 
 ### Action Tracking
 
-Per-step action log for audit trail and resume correctness:
+Per-step action log for audit trail and resume correctness.
 
-```typescript
-interface StepAction {
-  action_id: string;       // idempotency key: hash(step_id + op + path + inputs)
-  path: string;            // canonicalized: forward slashes, no trailing slash
-  op: "edit" | "create" | "delete" | "external";
-  pre_hash?: string;       // for edits: SHA-256 of raw file bytes before
-  post_hash?: string;      // for edits: SHA-256 of raw file bytes after
-  external_ref?: string;   // for external: ticket id, API response id, etc.
-}
+**StepAction fields:**
 
-// StepRecord includes:
-actions: StepAction[];
-```
+| Field | Purpose |
+|-------|---------|
+| `action_id` | Idempotency key: `hash(step_id + op + path + inputs)` |
+| `path` | Canonicalized file path (forward slashes, no trailing slash) |
+| `op` | edit, create, delete, external |
+| `pre_hash` | For edits: SHA-256 of raw file bytes before |
+| `post_hash` | For edits: SHA-256 of raw file bytes after |
+| `external_ref` | For external: ticket id, API response id, etc. |
 
 **Why action_id:** Enables idempotent replay. On resume, check if action already applied by comparing hashes.
 
 **Why external_ref:** External calls (create ticket, send email) can't be undone. Store the reference for audit and to detect "already done."
+
+**Canonical implementation:** `src/schemas/run-record.ts` — `StepActionSchema`
 
 ### DLQ + Resume
 
@@ -799,7 +752,7 @@ finn/
 │   ├── server.ts             # Tool definitions
 │   ├── engine/               # Step execution harness
 │   │   ├── index.ts          # Public exports
-│   │   ├── types.ts          # Step, StepContext, StepRunnerResult, StepRecord
+│   │   ├── types.ts          # Step, StepContext, StepInputs, RunConfig
 │   │   ├── executor.ts       # Topo-sort, semaphore, Promise.allSettled
 │   │   ├── run-writer.ts     # Serialized RunRecord writes
 │   │   └── idempotency.ts    # step_instance_id computation
