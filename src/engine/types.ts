@@ -50,7 +50,14 @@ export interface Step<_T = unknown> {
   /** Compute inputs for idempotency (pure function, no I/O) */
   getInputs(ctx: StepContext): StepInputs;
 
-  /** Execute the step */
+  /**
+   * Execute the step.
+   *
+   * Idempotency contract: On timeout, the executor retries without cancelling
+   * the in-flight attempt. Multiple run() calls may overlap. Steps must handle this:
+   * - Use optimistic locking for artifact writes
+   * - External side effects should be idempotent
+   */
   run(ctx: StepContext): Promise<StepRunnerResult>;
 }
 

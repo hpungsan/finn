@@ -242,6 +242,11 @@ First-class abstraction for testable, replayable orchestration. Workflows define
 
 **Why `getInputs()`:** Steps own their input computation. Enables testing input canonicalization without running LLMs.
 
+**Step idempotency contract:** When a step times out, the executor retries without cancelling the in-flight attempt. This means multiple executions of `run()` may overlap. Steps must be designed to handle this:
+- Artifact writes use optimistic locking (`expected_version`) — concurrent writes fail safely
+- External side effects should be idempotent or use deduplication keys
+- Long-running steps should periodically check if they should abort (future: `AbortSignal` support)
+
 **Canonical implementation:** `src/engine/types.ts` — `Step`, `StepContext`, `StepInputs`, `RunConfig`, `ArtifactInputRef`, `StepVersioning`
 
 **Domain types:** `src/schemas/run-record.ts` (`StepRecord`, `RunRecord`) and `src/schemas/step-result.ts` (`StepRunnerResult`, `PersistedStepResult`)
@@ -753,6 +758,7 @@ finn/
 │   ├── engine/               # Step execution harness
 │   │   ├── index.ts          # Public exports
 │   │   ├── types.ts          # Step, StepContext, StepInputs, RunConfig
+│   │   ├── errors.ts         # ExecutorError (graph validation errors)
 │   │   ├── executor.ts       # Topo-sort, semaphore, Promise.allSettled
 │   │   ├── run-writer.ts     # Serialized RunRecord writes
 │   │   └── idempotency.ts    # step_instance_id computation

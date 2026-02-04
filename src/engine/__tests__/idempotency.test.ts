@@ -49,6 +49,10 @@ describe("stableStringify", () => {
     expect(stableStringify(null)).toBe("null");
   });
 
+  test("handles undefined", () => {
+    expect(stableStringify(undefined)).toBe("null");
+  });
+
   test("handles boolean true", () => {
     expect(stableStringify(true)).toBe("true");
   });

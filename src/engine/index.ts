@@ -1,5 +1,24 @@
 // Types
 
+export type { ExecutorErrorCode } from "./errors.js";
+export { ExecutorError } from "./errors.js";
+export type {
+  BackoffConfig,
+  ExecuteOpts,
+  ExecuteResult,
+  StepExecutionResult,
+  TimeoutResult,
+} from "./executor.js";
+
+// Executor
+export {
+  calculateBackoff,
+  DEFAULT_BACKOFF,
+  execute,
+  sleep,
+  topoSort,
+  withTimeout,
+} from "./executor.js";
 // Idempotency
 export {
   canonicalizeInputs,
