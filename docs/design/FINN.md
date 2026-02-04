@@ -833,11 +833,13 @@ finn/
 │   │   ├── normalize.ts      # Name/workspace normalization
 │   │   └── sqlite.ts         # SqliteArtifactStore
 │   ├── schemas/              # Zod schemas per artifact kind
+│   │   ├── index.ts          # Public exports
 │   │   ├── explorer-finding.ts
-│   │   ├── verifier-output.ts
-│   │   └── run-record.ts
+│   │   ├── run-record.ts     # + ErrorCode, Status, StepAction, StepEvent, StepRecord
+│   │   └── step-result.ts    # Crash recovery artifact
 │   ├── policies/
-│   │   └── ttl.ts            # TTL constants per workspace/kind
+│   │   ├── index.ts          # Public exports
+│   │   └── ttl.ts            # TTL constants, storeArtifact() wrapper
 │   ├── renderers/            # Text renderers (data → markdown)
 │   │   ├── explorer.ts
 │   │   └── verifier.ts
