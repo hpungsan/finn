@@ -669,7 +669,7 @@ await storeArtifact({
   name: `${run_id}-code-explorer`,
   kind: "explorer-finding",
   data: output,
-  text: renderExplorerText(output),  // rendered view for LLM consumption
+  text: renderExplorerFinding(output),  // rendered view for LLM consumption
   run_id,
   role: "code-explorer",
 });  // → ttl_seconds: 3600 (1 hour, from WORKSPACE_TTL)
@@ -683,16 +683,11 @@ This ensures:
 
 ### Text Rendering
 
-Finn renders `text` from `data` before storing.
+Finn renders `text` from `data` before storing. Each artifact kind has a dedicated renderer that produces structured markdown for LLM consumption.
 
-```typescript
-const RENDERERS: Record<ArtifactKind, (data: unknown) => string> = {
-  "explorer-finding": renderExplorerFinding,
-  "verifier-output": renderVerifierOutput,
-  "run-record": renderRunRecord,
-  "dlq-entry": renderDlqEntry,
-};
-```
+**Invariant:** Renderers are pure functions `(data: T) → string`. They omit empty sections and group content for efficient LLM parsing.
+
+**Implementation:** `src/renderers/` — `renderExplorerFinding` (others added as needed)
 
 ### Subagent Memory
 
@@ -840,8 +835,8 @@ finn/
 │   │   ├── index.ts          # Public exports
 │   │   └── ttl.ts            # TTL constants, storeArtifact() wrapper
 │   ├── renderers/            # Text renderers (data → markdown)
-│   │   ├── explorer.ts
-│   │   └── verifier.ts
+│   │   ├── index.ts          # Public exports
+│   │   └── explorer-finding.ts
 │   └── moss/
 │       └── client.ts         # Moss MCP client (Capsule export)
 ├── package.json
