@@ -33,16 +33,31 @@ export type StoreArtifactOpts = StoreOpts & {
   workspace?: string;
 };
 
+/** Kinds that require numeric ttl_seconds (never permanent) */
+const REQUIRES_NUMERIC_TTL = ["run-record", "step-result"];
+
 /**
  * Store artifact with TTL policy applied.
+ * - Requires numeric ttl_seconds for run-record/step-result (use getRunRecordTtl())
  * - Uses workspace default TTL if ttl_seconds not provided (undefined)
- * - Passes through null (explicit no expiry)
+ * - Passes through null (explicit no expiry) for other kinds
  * - Validates kind-specific size limits
  */
 export async function storeArtifact(
   store: ArtifactStore,
   opts: StoreArtifactOpts,
 ) {
+  // Require numeric TTL for run durability artifacts (never permanent)
+  if (
+    REQUIRES_NUMERIC_TTL.includes(opts.kind) &&
+    typeof opts.ttl_seconds !== "number"
+  ) {
+    throw new ArtifactError(
+      "INVALID_REQUEST",
+      `${opts.kind} requires numeric ttl_seconds (use getRunRecordTtl())`,
+    );
+  }
+
   // Validate kind-specific size limits
   const dataJson = JSON.stringify(opts.data);
   const limit = KIND_SIZE_LIMITS[opts.kind] ?? KIND_SIZE_LIMITS.default;

@@ -70,6 +70,116 @@ describe("TTL policies", () => {
     expect(getRunRecordTtl("FAILED")).toBe(TTL.RUN_FAILURE);
   });
 
+  describe("numeric TTL requirement", () => {
+    test("run-record rejects undefined ttl_seconds", async () => {
+      await expect(
+        storeArtifact(store, {
+          workspace: "runs",
+          kind: "run-record",
+          data: {},
+        }),
+      ).rejects.toThrow(ArtifactError);
+
+      try {
+        await storeArtifact(store, {
+          workspace: "runs",
+          kind: "run-record",
+          data: {},
+        });
+      } catch (e) {
+        expect((e as ArtifactError).code).toBe("INVALID_REQUEST");
+        expect((e as ArtifactError).message).toContain("run-record");
+        expect((e as ArtifactError).message).toContain("ttl_seconds");
+      }
+    });
+
+    test("run-record rejects null ttl_seconds (no permanent runs)", async () => {
+      await expect(
+        storeArtifact(store, {
+          workspace: "runs",
+          kind: "run-record",
+          data: {},
+          ttl_seconds: null,
+        }),
+      ).rejects.toThrow(ArtifactError);
+
+      try {
+        await storeArtifact(store, {
+          workspace: "runs",
+          kind: "run-record",
+          data: {},
+          ttl_seconds: null,
+        });
+      } catch (e) {
+        expect((e as ArtifactError).code).toBe("INVALID_REQUEST");
+      }
+    });
+
+    test("step-result rejects undefined ttl_seconds", async () => {
+      await expect(
+        storeArtifact(store, {
+          workspace: "runs",
+          kind: "step-result",
+          data: {},
+        }),
+      ).rejects.toThrow(ArtifactError);
+
+      try {
+        await storeArtifact(store, {
+          workspace: "runs",
+          kind: "step-result",
+          data: {},
+        });
+      } catch (e) {
+        expect((e as ArtifactError).code).toBe("INVALID_REQUEST");
+      }
+    });
+
+    test("step-result rejects null ttl_seconds (no permanent step-results)", async () => {
+      await expect(
+        storeArtifact(store, {
+          workspace: "runs",
+          kind: "step-result",
+          data: {},
+          ttl_seconds: null,
+        }),
+      ).rejects.toThrow(ArtifactError);
+
+      try {
+        await storeArtifact(store, {
+          workspace: "runs",
+          kind: "step-result",
+          data: {},
+          ttl_seconds: null,
+        });
+      } catch (e) {
+        expect((e as ArtifactError).code).toBe("INVALID_REQUEST");
+      }
+    });
+
+    test("run-record works with explicit ttl_seconds", async () => {
+      const artifact = await storeArtifact(store, {
+        workspace: "runs",
+        kind: "run-record",
+        data: { run_id: "test" },
+        ttl_seconds: getRunRecordTtl("OK"),
+      });
+
+      expect(artifact.ttl_seconds).toBe(TTL.RUN_SUCCESS);
+    });
+
+    test("step-result works with explicit ttl_seconds", async () => {
+      const artifact = await storeArtifact(store, {
+        workspace: "runs",
+        kind: "step-result",
+        data: { status: "OK" },
+        ttl_seconds: getRunRecordTtl("FAILED"),
+      });
+
+      expect(artifact.ttl_seconds).toBe(TTL.RUN_FAILURE);
+    });
+  });
+
   describe("size limits", () => {
     test("throws DATA_TOO_LARGE when kind exceeds default limit", async () => {
       const largeData = "x".repeat(KIND_SIZE_LIMITS.default + 1);
@@ -103,6 +213,7 @@ describe("TTL policies", () => {
         workspace: "runs",
         kind: "run-record",
         data: mediumData,
+        ttl_seconds: getRunRecordTtl("OK"), // required for run-record
       });
 
       expect(artifact.kind).toBe("run-record");
@@ -116,6 +227,7 @@ describe("TTL policies", () => {
           workspace: "runs",
           kind: "run-record",
           data: hugeData,
+          ttl_seconds: getRunRecordTtl("OK"), // required for run-record
         }),
       ).rejects.toThrow(ArtifactError);
 
@@ -124,6 +236,7 @@ describe("TTL policies", () => {
           workspace: "runs",
           kind: "run-record",
           data: hugeData,
+          ttl_seconds: getRunRecordTtl("OK"),
         });
       } catch (e) {
         expect((e as ArtifactError).code).toBe("DATA_TOO_LARGE");

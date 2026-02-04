@@ -548,31 +548,17 @@ This section covers how **workflows use artifacts** — TTL policies, naming con
 
 The artifact store provides the mechanism (`ttl_seconds` on store). Finn owns the policy — what TTL to use for each artifact type.
 
-```typescript
-// Finn's TTL policy (constants)
-const TTL = {
-  EPHEMERAL: 3600,          // 1 hour - explorer findings
-  SESSION: 7200,            // 2 hours - verifier outputs, design specs
-  RUN_SUCCESS: 7 * 24 * 3600,   // 7 days
-  RUN_FAILURE: 30 * 24 * 3600,  // 30 days
-  PERSISTENT: null,         // no expiry - DLQ entries
-};
+**TTL Constants:**
 
-// Workspace → default TTL mapping
-const WORKSPACE_TTL: Record<string, number | null> = {
-  plan: TTL.EPHEMERAL,
-  feat: TTL.SESSION,
-  fix: TTL.SESSION,
-  runs: null,  // per-artifact (success vs failure)
-  dlq: TTL.PERSISTENT,
-};
+| Name | Value | Usage |
+|------|-------|-------|
+| EPHEMERAL | 1 hour | Explorer findings |
+| SESSION | 2 hours | Verifier outputs, design specs |
+| RUN_SUCCESS | 7 days | Successful run records |
+| RUN_FAILURE | 30 days | Failed/blocked run records |
+| PERSISTENT | no expiry | DLQ entries |
 
-// Wrapper applies TTL based on workspace (unless overridden)
-function storeArtifact(store: ArtifactStore, opts: ArtifactStoreOpts) {
-  const ttl = opts.ttl_seconds ?? WORKSPACE_TTL[opts.workspace];
-  return store.store({ ...opts, ttl_seconds: ttl });
-}
-```
+**Workspace Defaults:**
 
 | Workspace | TTL | Purpose |
 |-----------|-----|---------|
@@ -581,6 +567,12 @@ function storeArtifact(store: ArtifactStore, opts: ArtifactStoreOpts) {
 | `fix` | 2 hours | Fix session state |
 | `runs` | 7d / 30d | Run Records, step-results (success / failure) |
 | `dlq` | persistent | DLQ entries for resume |
+
+**`storeArtifact()` wrapper rules:**
+- `ttl_seconds: undefined` → use workspace default
+- `ttl_seconds: null` → explicit no expiry (pass through)
+- `ttl_seconds: number` → use as-is
+- `run-record` and `step-result` require numeric `ttl_seconds` (use `getRunRecordTtl()`) — permanent runs not allowed
 
 ### Size Limits
 
