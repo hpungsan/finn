@@ -194,12 +194,12 @@ Artifacts use raw + normalized addressing to prevent collisions while preserving
 | not set | `"error"` | yes | `NAME_ALREADY_EXISTS` |
 | not set | `"replace"` | no | Create |
 | not set | `"replace"` | yes | Overwrite (last-write-wins) |
-| set | (ignored) | no | `NOT_FOUND` |
-| set | (ignored) | version matches | Update, version++ |
-| set | (ignored) | version mismatch | `VERSION_MISMATCH` |
+| set | (ignored) | no (missing, deleted, or expired) | `NOT_FOUND` |
+| set | (ignored) | yes, version matches | Update, version++ |
+| set | (ignored) | yes, version mismatch | `VERSION_MISMATCH` |
 
 **When `expected_version` provided (optimistic locking):**
-- Artifact must exist → `NOT_FOUND` if missing
+- Artifact must be active (not deleted, not expired) → `NOT_FOUND` otherwise
 - Version must match → `VERSION_MISMATCH` if different
 - `mode` is ignored
 
@@ -211,7 +211,10 @@ Artifacts use raw + normalized addressing to prevent collisions while preserving
 
 **Name omitted:** Always creates new artifact with auto-generated ID.
 
-**By-name lookups:** When addressing by `workspace + name` (fetch, delete, store with expected_version), only active artifacts are matched. Soft-deleted artifacts are invisible to name-based addressing.
+**By-name lookups:** When addressing by `workspace + name`:
+- **fetch**: only active artifacts matched (soft-deleted and expired are invisible unless flags set)
+- **delete**: soft-deleted artifacts are invisible; expired artifacts are visible (soft-deleting them frees the name)
+- **store with expected_version**: only active artifacts matched (soft-deleted and expired → `NOT_FOUND`)
 
 **Atomic updates:** Optimistic locking must be implemented as a single atomic UPDATE, not read-then-write:
 Check `changes() == 1`. If 0, query to distinguish `NOT_FOUND` vs `VERSION_MISMATCH`. Single statement = no race window.

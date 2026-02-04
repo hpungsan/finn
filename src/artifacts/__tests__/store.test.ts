@@ -241,6 +241,40 @@ describe("SqliteArtifactStore", () => {
         }
       });
 
+      test("throws NOT_FOUND when artifact is expired", async () => {
+        const created = await store.store({
+          workspace: "test",
+          name: "artifact",
+          kind: "test-kind",
+          data: { status: "pending" },
+          ttl_seconds: 0,
+        });
+
+        await new Promise((r) => setTimeout(r, 10));
+
+        await expect(
+          store.store({
+            workspace: "test",
+            name: "artifact",
+            kind: "test-kind",
+            data: { status: "complete" },
+            expected_version: created.version,
+          }),
+        ).rejects.toThrow(ArtifactError);
+
+        try {
+          await store.store({
+            workspace: "test",
+            name: "artifact",
+            kind: "test-kind",
+            data: { status: "complete" },
+            expected_version: created.version,
+          });
+        } catch (e) {
+          expect((e as ArtifactError).code).toBe("NOT_FOUND");
+        }
+      });
+
       test("throws INVALID_REQUEST when expected_version without name", async () => {
         await expect(
           store.store({

@@ -179,6 +179,7 @@ export class SqliteArtifactStore implements ArtifactStore {
         WHERE workspace_norm = @workspace_norm
           AND name_norm = @name_norm
           AND version = @expected_version
+          AND (expires_at IS NULL OR expires_at > @now)
           AND deleted_at IS NULL
       `),
       softDelete: this.db.prepare(`
@@ -345,6 +346,7 @@ export class SqliteArtifactStore implements ArtifactStore {
         expires_at:
           opts.ttl_seconds != null ? now + opts.ttl_seconds * 1000 : null,
         updated_at: now,
+        now,
         expected_version: opts.expected_version,
       };
 
@@ -358,6 +360,9 @@ export class SqliteArtifactStore implements ArtifactStore {
         ) as Record<string, unknown> | undefined;
 
         if (!existing || this.isDeleted(existing)) {
+          throw new ArtifactError("NOT_FOUND", "Artifact not found");
+        }
+        if (this.isExpired(existing)) {
           throw new ArtifactError("NOT_FOUND", "Artifact not found");
         }
         throw new ArtifactError(
