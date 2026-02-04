@@ -22,6 +22,28 @@ RunRecord `step_seq` is append order — parallel steps can finish in different 
 
 ---
 
+#### Renderer Registry
+
+Currently workflows import renderers directly (`renderExplorerFinding`). Add a registry for dynamic dispatch by artifact kind when multiple renderers exist.
+
+```typescript
+const RENDERERS: Record<ArtifactKind, (data: unknown) => string> = {
+  "explorer-finding": renderExplorerFinding,
+  "verifier-output": renderVerifierOutput,
+  // ...
+};
+
+function renderArtifact(kind: string, data: unknown): string {
+  const renderer = RENDERERS[kind];
+  if (!renderer) throw new Error(`No renderer for kind: ${kind}`);
+  return renderer(data);
+}
+```
+
+**When to add:** Once 3+ renderers exist. Not needed with just `explorer-finding`.
+
+---
+
 #### Per-Tool Rate Limits
 
 Base has semaphore concurrency for steps. Add per-tool rate limits for commands/search that may have stricter API limits.

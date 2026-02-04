@@ -241,7 +241,7 @@ interface Step<T = unknown> {
   model: string;            // model to use, e.g., "sonnet", "haiku" — included in step_instance_id
   prompt_version: string;   // required for replay correctness, e.g., "code-explorer@2"
   schema_version: string;   // required for replay correctness, e.g., "explorer-finding@1"
-  run(ctx: StepContext): Promise<StepResult<T>>;
+  run(ctx: StepContext): Promise<StepRunnerResult>;
 }
 
 interface StepContext {
@@ -360,13 +360,6 @@ type StepEvent =
 
 type Status = "PENDING" | "RUNNING" | "OK" | "RETRYING" | "BLOCKED" | "FAILED";
 
-// Canonical return type from step runners
-type StepResult =
-  | { status: "OK"; artifact_ids: string[] }
-  | { status: "RETRY"; error: ErrorCode }
-  | { status: "BLOCKED"; error: ErrorCode; note?: string }
-  | { status: "FAILED"; error: ErrorCode; note?: string };
-
 type ErrorCode =
   | "TIMEOUT"
   | "SCHEMA_INVALID"
@@ -376,6 +369,20 @@ type ErrorCode =
   | "THRASHING"
   | "HUMAN_REQUIRED";
 ```
+
+**Step Result Types:**
+
+| Type | Status | Fields | Purpose |
+|------|--------|--------|---------|
+| `StepRunnerResult` | OK | `artifact_ids`, `actions?` | Runner succeeded |
+| | RETRY | `error` | Retry with backoff (not persisted) |
+| | BLOCKED | `artifact_ids`, `actions?`, `error`, `note?` | Needs human intervention |
+| | FAILED | `artifact_ids`, `actions?`, `error`, `note?` | Unrecoverable failure |
+| `PersistedStepResult` | OK | `artifact_ids`, `actions?` | Terminal: success |
+| | BLOCKED | `artifact_ids`, `actions?`, `error`, `note?` | Terminal: blocked |
+| | FAILED | `artifact_ids`, `actions?`, `error`, `note?` | Terminal: failed |
+
+RETRY is internal to the engine loop — only terminal states are persisted as `kind:"step-result"` artifacts.
 
 **Event sourcing:** `events` is the source of truth. `status` and `retry_count` are derived on load by folding events. This ensures crash recovery correctness — no stale cached state.
 
@@ -541,31 +548,17 @@ This section covers how **workflows use artifacts** — TTL policies, naming con
 
 The artifact store provides the mechanism (`ttl_seconds` on store). Finn owns the policy — what TTL to use for each artifact type.
 
-```typescript
-// Finn's TTL policy (constants)
-const TTL = {
-  EPHEMERAL: 3600,          // 1 hour - explorer findings
-  SESSION: 7200,            // 2 hours - verifier outputs, design specs
-  RUN_SUCCESS: 7 * 24 * 3600,   // 7 days
-  RUN_FAILURE: 30 * 24 * 3600,  // 30 days
-  PERSISTENT: null,         // no expiry - DLQ entries
-};
+**TTL Constants:**
 
-// Workspace → default TTL mapping
-const WORKSPACE_TTL: Record<string, number | null> = {
-  plan: TTL.EPHEMERAL,
-  feat: TTL.SESSION,
-  fix: TTL.SESSION,
-  runs: null,  // per-artifact (success vs failure)
-  dlq: TTL.PERSISTENT,
-};
+| Name | Value | Usage |
+|------|-------|-------|
+| EPHEMERAL | 1 hour | Explorer findings |
+| SESSION | 2 hours | Verifier outputs, design specs |
+| RUN_SUCCESS | 7 days | Successful run records |
+| RUN_FAILURE | 30 days | Failed/blocked run records |
+| PERSISTENT | no expiry | DLQ entries |
 
-// Wrapper applies TTL based on workspace (unless overridden)
-function storeArtifact(store: ArtifactStore, opts: ArtifactStoreOpts) {
-  const ttl = opts.ttl_seconds ?? WORKSPACE_TTL[opts.workspace];
-  return store.store({ ...opts, ttl_seconds: ttl });
-}
-```
+**Workspace Defaults:**
 
 | Workspace | TTL | Purpose |
 |-----------|-----|---------|
@@ -574,6 +567,12 @@ function storeArtifact(store: ArtifactStore, opts: ArtifactStoreOpts) {
 | `fix` | 2 hours | Fix session state |
 | `runs` | 7d / 30d | Run Records, step-results (success / failure) |
 | `dlq` | persistent | DLQ entries for resume |
+
+**`storeArtifact()` wrapper rules:**
+- `ttl_seconds: undefined` → use workspace default
+- `ttl_seconds: null` → explicit no expiry (pass through)
+- `ttl_seconds: number` → use as-is
+- `run-record` and `step-result` require positive finite `ttl_seconds` (use `getRunRecordTtl()`) — permanent runs not allowed
 
 ### Size Limits
 
@@ -670,7 +669,7 @@ await storeArtifact({
   name: `${run_id}-code-explorer`,
   kind: "explorer-finding",
   data: output,
-  text: renderExplorerText(output),  // rendered view for LLM consumption
+  text: renderExplorerFinding(output),  // rendered view for LLM consumption
   run_id,
   role: "code-explorer",
 });  // → ttl_seconds: 3600 (1 hour, from WORKSPACE_TTL)
@@ -684,16 +683,11 @@ This ensures:
 
 ### Text Rendering
 
-Finn renders `text` from `data` before storing.
+Finn renders `text` from `data` before storing. Each artifact kind has a dedicated renderer that produces structured markdown for LLM consumption.
 
-```typescript
-const RENDERERS: Record<ArtifactKind, (data: unknown) => string> = {
-  "explorer-finding": renderExplorerFinding,
-  "verifier-output": renderVerifierOutput,
-  "run-record": renderRunRecord,
-  "dlq-entry": renderDlqEntry,
-};
-```
+**Invariant:** Renderers are pure functions `(data: T) → string`. They omit empty sections and group content for efficient LLM parsing.
+
+**Implementation:** `src/renderers/` — `renderExplorerFinding` (others added as needed)
 
 ### Subagent Memory
 
@@ -805,7 +799,7 @@ finn/
 │   ├── server.ts             # Tool definitions
 │   ├── engine/               # Step execution harness
 │   │   ├── index.ts          # Public exports
-│   │   ├── types.ts          # Step, StepContext, StepResult, StepRecord
+│   │   ├── types.ts          # Step, StepContext, StepRunnerResult, StepRecord
 │   │   ├── executor.ts       # Topo-sort, semaphore, Promise.allSettled
 │   │   ├── run-writer.ts     # Serialized RunRecord writes
 │   │   └── idempotency.ts    # step_instance_id computation
@@ -833,14 +827,16 @@ finn/
 │   │   ├── normalize.ts      # Name/workspace normalization
 │   │   └── sqlite.ts         # SqliteArtifactStore
 │   ├── schemas/              # Zod schemas per artifact kind
+│   │   ├── index.ts          # Public exports
 │   │   ├── explorer-finding.ts
-│   │   ├── verifier-output.ts
-│   │   └── run-record.ts
+│   │   ├── run-record.ts     # + ErrorCode, Status, StepAction, StepEvent, StepRecord
+│   │   └── step-result.ts    # Crash recovery artifact
 │   ├── policies/
-│   │   └── ttl.ts            # TTL constants per workspace/kind
+│   │   ├── index.ts          # Public exports
+│   │   └── ttl.ts            # TTL constants, storeArtifact() wrapper
 │   ├── renderers/            # Text renderers (data → markdown)
-│   │   ├── explorer.ts
-│   │   └── verifier.ts
+│   │   ├── index.ts          # Public exports
+│   │   └── explorer-finding.ts
 │   └── moss/
 │       └── client.ts         # Moss MCP client (Capsule export)
 ├── package.json
