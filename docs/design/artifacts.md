@@ -52,8 +52,7 @@ interface ArtifactStore {
 
 | Implementation | Use Case |
 |----------------|----------|
-| `SqliteArtifactStore` | Production — persistent storage |
-| `InMemoryArtifactStore` | Tests — no external dependencies |
+| `SqliteArtifactStore` | Production and tests (`:memory:` for fast tests) |
 
 ---
 
@@ -195,12 +194,12 @@ Artifacts use raw + normalized addressing to prevent collisions while preserving
 | not set | `"error"` | yes | `NAME_ALREADY_EXISTS` |
 | not set | `"replace"` | no | Create |
 | not set | `"replace"` | yes | Overwrite (last-write-wins) |
-| set | (ignored) | no | `NOT_FOUND` |
-| set | (ignored) | version matches | Update, version++ |
-| set | (ignored) | version mismatch | `VERSION_MISMATCH` |
+| set | (ignored) | no (missing, deleted, or expired) | `NOT_FOUND` |
+| set | (ignored) | yes, version matches | Update, version++ |
+| set | (ignored) | yes, version mismatch | `VERSION_MISMATCH` |
 
 **When `expected_version` provided (optimistic locking):**
-- Artifact must exist → `NOT_FOUND` if missing
+- Artifact must be active (not deleted, not expired) → `NOT_FOUND` otherwise
 - Version must match → `VERSION_MISMATCH` if different
 - `mode` is ignored
 
@@ -208,15 +207,16 @@ Artifacts use raw + normalized addressing to prevent collisions while preserving
 - `mode: "error"` (default): fail with `NAME_ALREADY_EXISTS` if name exists
 - `mode: "replace"`: overwrite if exists, create if not
 
-**Replace semantics:** True replace — all fields overwritten. Omitted optional fields are cleared, not preserved. For partial updates, use fetch-merge-store: fetch current artifact, merge changes, store with `expected_version`.
+**Replace semantics:** Overwrites content fields (kind, data, text, orchestration fields, ttl). Lifecycle fields follow update semantics: `version` increments, `updated_at` = now, `created_at` preserved. Omitted optional fields are cleared, not preserved. For partial updates, use fetch-merge-store: fetch current artifact, merge changes, store with `expected_version`.
 
 **Name omitted:** Always creates new artifact with auto-generated ID.
 
+**By-name lookups:** When addressing by `workspace + name`:
+- **fetch**: only active artifacts matched (soft-deleted and expired are invisible unless flags set)
+- **delete**: soft-deleted artifacts are invisible; expired artifacts are visible (soft-deleting them frees the name)
+- **store with expected_version**: only active artifacts matched (soft-deleted and expired → `NOT_FOUND`)
+
 **Atomic updates:** Optimistic locking must be implemented as a single atomic UPDATE, not read-then-write:
-```sql
-UPDATE artifacts SET ..., version = version + 1
-WHERE workspace_norm=? AND name_norm=? AND version=? AND deleted_at IS NULL
-```
 Check `changes() == 1`. If 0, query to distinguish `NOT_FOUND` vs `VERSION_MISMATCH`. Single statement = no race window.
 
 ### Version Semantics
@@ -232,7 +232,7 @@ All timestamps are **milliseconds** (Unix epoch):
 - `created_at`, `updated_at`, `deleted_at`, `expires_at` — milliseconds
 - `ttl_seconds` — seconds (as named)
 
-Expiration formula: `expires_at = created_at + (ttl_seconds * 1000)`
+Expiration formula (computed at write time): `expires_at = now_ms + (ttl_seconds * 1000)`
 
 Mixing units causes "everything expired instantly" bugs.
 
@@ -240,7 +240,7 @@ Mixing units causes "everything expired instantly" bugs.
 
 **On store:** If `ttl_seconds` provided, compute `expires_at = now_ms + (ttl_seconds * 1000)`.
 
-**On read/list/fetch:** Filter out expired artifacts by default (`expires_at < now`).
+**On read/list/fetch:** Filter out expired artifacts by default (`expires_at <= now`).
 
 **Expiration cleanup:** Lazy filter + opportunistic batch purge on writes.
 
@@ -250,7 +250,7 @@ WHERE (expires_at IS NULL OR expires_at > ?)
 
 // Write path (throttled, every 5 min): soft-delete expired
 UPDATE artifacts SET deleted_at = ?
-WHERE expires_at IS NOT NULL AND expires_at < ? AND deleted_at IS NULL
+WHERE expires_at IS NOT NULL AND expires_at <= ? AND deleted_at IS NULL
 LIMIT 100;
 ```
 
@@ -262,14 +262,7 @@ This must be transactional (BEGIN/COMMIT) to avoid race conditions.
 
 ### List Behavior
 
-**Deterministic ordering:** Always use tie-breaker for stable results:
-```sql
-ORDER BY updated_at DESC, id DESC
--- or
-ORDER BY created_at DESC, id DESC
-```
-
-Without tie-breaker, rows with same timestamp return in undefined order across queries. This breaks fan-in determinism and test stability.
+**Deterministic ordering:** Always uses id as tie-breaker for stable results across queries.
 
 ### Compose Behavior
 
@@ -365,103 +358,6 @@ CREATE INDEX idx_artifacts_updated ON artifacts(updated_at DESC) WHERE deleted_a
 
 ---
 
-## Usage Examples
-
-### Basic Operations
-
-```typescript
-import { SqliteArtifactStore } from "./artifacts/sqlite";
-
-const store = new SqliteArtifactStore({ dbPath: "./artifacts.db" });
-
-// Store
-const artifact = await store.store({
-  workspace: "runs",
-  name: "run-123",
-  kind: "run-record",
-  data: { status: "running", steps: [] },
-  ttl_seconds: 7 * 24 * 3600,  // 7 days
-});
-
-// Fetch
-const fetched = await store.fetch({ workspace: "runs", name: "run-123" });
-
-// Update with optimistic locking
-await store.store({
-  workspace: "runs",
-  name: "run-123",
-  kind: "run-record",
-  data: { ...fetched.data, status: "complete" },
-  expected_version: fetched.version,
-});
-
-// List
-const { items } = await store.list({
-  workspace: "runs",
-  kind: "run-record",
-  limit: 10,
-});
-
-// Delete
-await store.delete({ workspace: "runs", name: "run-123" });
-```
-
-### Fan-out / Fan-in Pattern
-
-```typescript
-const run_id = "plan-auth-1234";
-
-// Fan-out: Multiple agents store findings
-await store.store({
-  workspace: "plan",
-  name: `${run_id}-code-explorer`,
-  kind: "explorer-finding",
-  data: codeExplorerOutput,              // Validated with Zod before store
-  text: renderExplorerFinding(output),   // Rendered by caller
-  run_id,
-  role: "code-explorer",
-  ttl_seconds: 3600,
-});
-
-// Fan-in: Gather all findings
-const { items } = await store.list({ run_id, kind: "explorer-finding" });
-
-// Code operates on structured data
-const allFiles = items.flatMap(f => f.data.files);
-const sorted = allFiles.sort((a, b) => b.relevance - a.relevance);
-
-// Compose for LLM consumption
-const { bundle_text } = await store.compose({
-  items: items.map(f => ({ id: f.id })),
-  format: "markdown",
-});
-```
-
-### Cross-Round Memory
-
-```typescript
-// Round 1: Store verifier output
-await store.store({
-  workspace: "feat",
-  name: `${run_id}-verifier-r1`,
-  kind: "verifier-output",
-  data: { verdict: "concerns", issues: [...] },
-  text: renderVerifierOutput(output),
-  run_id,
-  role: "impl-verifier",
-  ttl_seconds: 7200,
-});
-
-// Round 2: Fetch previous, compare
-const prev = await store.fetch({
-  workspace: "feat",
-  name: `${run_id}-verifier-r1`,
-});
-const resolved = prev.data.issues.filter(i => !currentIssues.has(i.id));
-```
-
----
-
 ## Design Principles
 
 ### 1. Semantics-Light Storage
@@ -497,15 +393,7 @@ text (markdown) ─→ derived view for LLMs, caller provides
 
 ### 4. Optimistic Concurrency
 
-`version` + `expected_version` enables safe read-modify-write:
-```typescript
-const current = await store.fetch({ ... });
-await store.store({
-  ...opts,
-  data: modify(current.data),
-  expected_version: current.version,  // Fails if changed
-});
-```
+`version` + `expected_version` enables safe read-modify-write without race conditions.
 
 ---
 
@@ -523,4 +411,3 @@ Finn artifacts and Moss capsules share **design patterns** but no code dependenc
 | Compose operation | Artifacts only | Capsules have different bundling needs |
 
 **The boundary:** Moss provides capsules for LLM session handoffs. Finn owns its orchestration state via this internal artifact store.
-

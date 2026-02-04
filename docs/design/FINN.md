@@ -81,8 +81,7 @@ Artifacts are Finn's internal state layer. Lore are persistent artifacts (`works
 │  │  store(), fetch(), list(), compose()                      │  │
 │  │                                                            │  │
 │  │  Implementations:                                          │  │
-│  │  - SqliteArtifactStore (production)                       │  │
-│  │  - InMemoryArtifactStore (tests)                          │  │
+│  │  - SqliteArtifactStore (production + tests)               │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
@@ -832,8 +831,7 @@ finn/
 │   │   ├── errors.ts         # ArtifactError, ErrorCode
 │   │   ├── store.ts          # ArtifactStore interface
 │   │   ├── normalize.ts      # Name/workspace normalization
-│   │   ├── memory.ts         # InMemoryArtifactStore (Stage 2)
-│   │   └── sqlite.ts         # SqliteArtifactStore (Stage 3)
+│   │   └── sqlite.ts         # SqliteArtifactStore
 │   ├── schemas/              # Zod schemas per artifact kind
 │   │   ├── explorer-finding.ts
 │   │   ├── verifier-output.ts
