@@ -8,22 +8,21 @@ I built [Moss](https://github.com/hpungsan/moss) to handle context handoffs betw
 
 ## Problem
 
-Prompt-based skills can't guarantee execution. No try/catch, no enforced loops, no reliable parallelism. I wanted deterministic orchestration.
+Prompt-based skills can't guarantee execution. No try/catch, no enforced loops, no reliable parallelism. I wanted deterministic control flow.
 
 ## Solution
 
-- **Agent SDK** — Programmatic control over agent execution (`Promise.allSettled`, `for` loops, `try/catch`)
-- **MCP** — Expose workflows as tools to Claude Code (user still types `/plan`, `/feat`, `/fix`)
-- **Artifacts** — Finn's internal durable state layer (typed JSON, scoped by `run_id`)
-- **[Moss](https://github.com/hpungsan/moss)** — External handoffs via capsules
+**Subagents do the thinking.** Explorers, verifiers, and stitchers are LLMs that make judgment calls — "what's relevant?", "is this correct?", "how do I combine these findings?"
+
+**Code does the routing.** Loops, fan-out/fan-in, timeouts, retries — all enforced by code, not suggested by prompts.
 
 Same UX, deterministic control flow.
 
 ## How It Works
 
-**Subagents do the thinking.** Explorers, verifiers, and stitchers are LLMs that make judgment calls — "what's relevant?", "is this correct?", "how do I combine these findings?"
-
-**Code does the routing.** Code orchestrates the flow — loop control, fan-out/fan-in, timeout handling, retry policies. No LLM deciding "what's next?" when the answer is deterministic.
+- **Artifacts** — Internal durable state (typed JSON, scoped by `run_id`, TTL-managed)
+- **[Moss](https://github.com/hpungsan/moss)** — External handoffs via capsules
+- **Agent SDK + MCP** — Programmatic orchestration exposed as Claude Code tools
 
 ## Workflows
 
