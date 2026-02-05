@@ -39,3 +39,6 @@ dev/
 # Temp
 tmp/
 *.tmp
+
+# Moss local config
+.moss/

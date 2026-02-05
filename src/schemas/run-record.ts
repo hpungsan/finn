@@ -9,6 +9,7 @@ export const ErrorCodeSchema = z.enum([
   "RATE_LIMIT",
   "THRASHING",
   "HUMAN_REQUIRED",
+  "STEP_DEFINITION_MISMATCH",
 ]);
 
 export const StatusSchema = z.enum([

@@ -181,6 +181,7 @@ Machine-checkable gating, not markdown regex.
 - `src/schemas/explorer-finding.ts` — `ExplorerFindingSchema`
 - `src/schemas/run-record.ts` — `RunRecordSchema`, `ErrorCodeSchema`, `StatusSchema`
 - `src/schemas/step-result.ts` — `StepRunnerResultSchema`, `PersistedStepResultSchema`
+- `src/schemas/dlq-entry.ts` — `DlqEntrySchema`
 
 ### Timeout + Retry Policy
 
@@ -287,8 +288,16 @@ This makes crash recovery provably correct: step-result artifact is atomic proof
 - `recordStepStarted()`: No-op if `step_instance_id` already exists (prevents duplicate RUNNING records)
 - `recordStepSkipped()`: No-op if terminal record already exists (prevents duplicates for completed steps)
 - `recordStepCompleted()`: Prefers RUNNING record, throws `STEP_NOT_FOUND` if no match
+- `recordStepRecovered()`: Throws `STEP_NOT_FOUND` if step_instance_id not found (invariant violation)
 
 This ensures resume never creates duplicate or orphan StepRecords, even when re-running steps that were RUNNING at crash time.
+
+**Definition mismatch on resume:** If a RUNNING StepRecord references a step_id not in the current step definitions, recovery:
+1. Finalizes the run as `BLOCKED` with error `STEP_DEFINITION_MISMATCH`
+2. Creates a DLQ entry with partial results (completed steps' artifacts)
+3. Throws `STEP_DEFINITION_MISMATCH` to the caller
+
+This prevents orphan RUNNING runs and provides structured recovery path. Causes: workflow definition changed between crash and resume, or wrong workflow invoked for resume.
 
 **SQLite atomicity:** Step-result artifact + RunRecord event append should be a single SQLite transaction (`BEGIN IMMEDIATE`) when possible. RunWriter serializes writes through one connection. Crash recovery logic handles edge cases where transaction isn't achievable.
 
@@ -464,10 +473,15 @@ Per-step action log for audit trail and resume correctness.
 When a workflow fails after retries exhausted, store failure state for later resumption.
 
 **DLQ Entry:** Stored as artifact (`kind: "dlq-entry"`) in `workspace: "dlq"` (persistent, no TTL):
-- `data`: `workflow`, `task`, `failed_step`, `inputs`, `retry_count`, `last_error`, `relevant_files`, `partial_results`
+- `data`: `workflow`, `task`, `failed_step`, `inputs`, `retry_count`, `last_error`, `relevant_files`, `partial_results`, `summary`
 - `run_id`: from artifact metadata (not duplicated in data)
 - `failed_at`: use artifact's `created_at`
-- `text`: human-readable failure summary (optional, for debugging)
+
+**Canonical implementation:** `src/schemas/dlq-entry.ts` — `DlqEntrySchema`
+
+**DLQ triggers:**
+- Workflow fails after retries exhausted
+- `STEP_DEFINITION_MISMATCH` on resume (workflow definitions changed)
 
 **Resume flow:**
 1. `finn resume <run_id>` fetches DLQ entry
@@ -809,6 +823,7 @@ finn/
 │   │   └── sqlite.ts         # SqliteArtifactStore
 │   ├── schemas/              # Zod schemas per artifact kind
 │   │   ├── index.ts          # Public exports
+│   │   ├── dlq-entry.ts      # DLQ entry for failed/blocked runs
 │   │   ├── explorer-finding.ts
 │   │   ├── run-record.ts     # + ErrorCode, Status, StepAction, StepEvent, StepRecord
 │   │   └── step-result.ts    # Crash recovery artifact

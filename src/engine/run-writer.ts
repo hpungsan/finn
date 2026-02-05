@@ -305,20 +305,27 @@ export class RunWriter {
       const stepRecord = record.steps.find(
         (s) => s.step_instance_id === step_instance_id,
       );
-      if (stepRecord) {
-        stepRecord.status = data.status;
-        stepRecord.events = [
-          ...stepRecord.events,
-          { type: "RECOVERED", at: now_ts },
-          { type: data.status, at: now_ts },
-        ];
-        stepRecord.artifact_ids = data.artifact_ids;
-        if ("actions" in data && data.actions) {
-          stepRecord.actions = data.actions;
-        }
-        if ("error" in data && data.error) {
-          stepRecord.error_code = data.error;
-        }
+      if (!stepRecord) {
+        // Invariant violation: step_instance_id came from this record's steps
+        throw new ExecutorError(
+          "STEP_NOT_FOUND",
+          `recordStepRecovered: step_instance_id ${step_instance_id} not found in RunRecord`,
+          { step_instance_id, run_id: this.run_id },
+        );
+      }
+
+      stepRecord.status = data.status;
+      stepRecord.events = [
+        ...stepRecord.events,
+        { type: "RECOVERED", at: now_ts },
+        { type: data.status, at: now_ts },
+      ];
+      stepRecord.artifact_ids = data.artifact_ids;
+      if ("actions" in data && data.actions) {
+        stepRecord.actions = data.actions;
+      }
+      if ("error" in data && data.error) {
+        stepRecord.error_code = data.error;
       }
       record.updated_at = now_ts;
     });

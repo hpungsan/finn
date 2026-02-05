@@ -1,3 +1,4 @@
+export { type DlqEntry, DlqEntrySchema } from "./dlq-entry.js";
 export {
   type ExplorerFinding,
   ExplorerFindingSchema,
