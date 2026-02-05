@@ -4,7 +4,8 @@ export type ExecutorErrorCode =
   | "DUPLICATE_STEP_ID" // multiple steps share the same id
   | "RUN_OWNED_BY_OTHER" // owner_id mismatch on resume
   | "RUN_ALREADY_COMPLETE" // RunRecord has terminal status (OK/BLOCKED/FAILED)
-  | "INVALID_RUN_RECORD"; // RunRecord data failed schema validation
+  | "INVALID_RUN_RECORD" // RunRecord data failed schema validation
+  | "STEP_NOT_FOUND"; // recordStepCompleted called without matching RUNNING record
 
 export class ExecutorError extends Error {
   constructor(

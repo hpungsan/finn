@@ -483,6 +483,104 @@ describe("RunWriter", () => {
       // Should have attempted twice (initial + 1 retry)
       expect(callCount).toBe(2);
     });
+
+    test("throws RUN_OWNED_BY_OTHER if owner changes during VERSION_MISMATCH reload", async () => {
+      const writer = new RunWriter({
+        store,
+        run_id: "test-run",
+        owner_id: "owner-1",
+        workflow: "plan",
+        args: {},
+        repo_hash: "abc123",
+        config: defaultConfig,
+      });
+      await writer.init();
+
+      // Get current artifact
+      const artifact = await store.fetch({
+        workspace: "runs",
+        name: "test-run",
+      });
+      const currentVersion = artifact?.version ?? 1;
+
+      // Externally update with different owner (simulates another process taking over)
+      const hijackedRecord = {
+        ...(artifact?.data as RunRecord),
+        owner_id: "owner-2", // Different owner
+      };
+      await store.store({
+        workspace: "runs",
+        name: "test-run",
+        kind: "run-record",
+        data: hijackedRecord,
+        ttl_seconds: 3600,
+        expected_version: currentVersion,
+        mode: "replace",
+      });
+
+      const step = createMockStep({ id: "step-1" });
+
+      // This should fail because after VERSION_MISMATCH, reload shows different owner
+      await expect(
+        writer.recordStepStarted(step, "instance-1", "digest-1"),
+      ).rejects.toThrow(ExecutorError);
+
+      try {
+        await writer.recordStepStarted(step, "instance-2", "digest-2");
+      } catch (e) {
+        expect((e as ExecutorError).code).toBe("RUN_OWNED_BY_OTHER");
+        expect((e as ExecutorError).message).toContain("was taken by owner-2");
+      }
+    });
+
+    test("throws RUN_ALREADY_COMPLETE if status changes during VERSION_MISMATCH reload", async () => {
+      const writer = new RunWriter({
+        store,
+        run_id: "test-run",
+        owner_id: "owner-1",
+        workflow: "plan",
+        args: {},
+        repo_hash: "abc123",
+        config: defaultConfig,
+      });
+      await writer.init();
+
+      // Get current artifact
+      const artifact = await store.fetch({
+        workspace: "runs",
+        name: "test-run",
+      });
+      const currentVersion = artifact?.version ?? 1;
+
+      // Externally finalize the run (simulates race where run completed elsewhere)
+      const finalizedRecord = {
+        ...(artifact?.data as RunRecord),
+        status: "OK" as const, // Terminal status
+      };
+      await store.store({
+        workspace: "runs",
+        name: "test-run",
+        kind: "run-record",
+        data: finalizedRecord,
+        ttl_seconds: 3600,
+        expected_version: currentVersion,
+        mode: "replace",
+      });
+
+      const step = createMockStep({ id: "step-1" });
+
+      // This should fail because after VERSION_MISMATCH, reload shows terminal status
+      await expect(
+        writer.recordStepStarted(step, "instance-1", "digest-1"),
+      ).rejects.toThrow(ExecutorError);
+
+      try {
+        await writer.recordStepStarted(step, "instance-2", "digest-2");
+      } catch (e) {
+        expect((e as ExecutorError).code).toBe("RUN_ALREADY_COMPLETE");
+        expect((e as ExecutorError).message).toContain("was finalized (OK)");
+      }
+    });
   });
 
   describe("serialization", () => {
@@ -577,6 +675,206 @@ describe("RunWriter", () => {
       const data = artifact?.data as RunRecord;
       expect(data.run_id).toBe("test-run");
       expect(data.steps).toHaveLength(1);
+    });
+  });
+
+  describe("idempotency - crash recovery", () => {
+    test("recordStepStarted is idempotent - no duplicate on same step_instance_id", async () => {
+      const writer = new RunWriter({
+        store,
+        run_id: "test-run",
+        owner_id: "owner-1",
+        workflow: "plan",
+        args: {},
+        repo_hash: "abc123",
+        config: defaultConfig,
+      });
+      await writer.init();
+
+      const step = createMockStep({ id: "step-1" });
+
+      // Call twice with same step_instance_id (simulates resume scenario)
+      await writer.recordStepStarted(step, "instance-1", "digest-1");
+      await writer.recordStepStarted(step, "instance-1", "digest-1");
+
+      const record = writer.getRunRecord();
+      // Should have exactly 1 record, not 2
+      expect(record?.steps).toHaveLength(1);
+      expect(record?.steps[0].step_instance_id).toBe("instance-1");
+    });
+
+    test("recordStepSkipped is idempotent - no duplicate if terminal record exists", async () => {
+      const writer = new RunWriter({
+        store,
+        run_id: "test-run",
+        owner_id: "owner-1",
+        workflow: "plan",
+        args: {},
+        repo_hash: "abc123",
+        config: defaultConfig,
+      });
+      await writer.init();
+
+      const step = createMockStep({ id: "step-1" });
+
+      // First: record step completed normally
+      await writer.recordStepStarted(step, "instance-1", "digest-1");
+      await writer.recordStepCompleted(
+        step,
+        "instance-1",
+        "OK",
+        [{ type: "STARTED", at: "2024-01-01T00:00:00Z" }],
+        ["artifact-1"],
+        undefined,
+        0,
+        0,
+      );
+
+      // Now call recordStepSkipped (simulates resume idempotency check)
+      await writer.recordStepSkipped(step, "instance-1", "digest-1", {
+        status: "OK",
+        artifact_ids: ["artifact-1"],
+      });
+
+      const record = writer.getRunRecord();
+      // Should still have exactly 1 record, not 2
+      expect(record?.steps).toHaveLength(1);
+      expect(record?.steps[0].status).toBe("OK");
+    });
+
+    test("recordStepSkipped adds record if only RUNNING exists", async () => {
+      const writer = new RunWriter({
+        store,
+        run_id: "test-run",
+        owner_id: "owner-1",
+        workflow: "plan",
+        args: {},
+        repo_hash: "abc123",
+        config: defaultConfig,
+      });
+      await writer.init();
+
+      const step = createMockStep({ id: "step-1" });
+
+      // Record step as RUNNING (simulates crash scenario)
+      await writer.recordStepStarted(step, "instance-1", "digest-1");
+
+      // Now call recordStepSkipped - RUNNING is not terminal, so this should add
+      await writer.recordStepSkipped(step, "instance-1", "digest-1", {
+        status: "OK",
+        artifact_ids: ["artifact-1"],
+      });
+
+      const record = writer.getRunRecord();
+      // Now has 2 records (original RUNNING + new OK)
+      // This is expected - the RUNNING one will be cleaned up or ignored
+      expect(record?.steps).toHaveLength(2);
+    });
+
+    test("recordStepCompleted throws STEP_NOT_FOUND if no matching record", async () => {
+      const writer = new RunWriter({
+        store,
+        run_id: "test-run",
+        owner_id: "owner-1",
+        workflow: "plan",
+        args: {},
+        repo_hash: "abc123",
+        config: defaultConfig,
+      });
+      await writer.init();
+
+      const step = createMockStep({ id: "step-1" });
+
+      // Try to complete a step that was never started
+      await expect(
+        writer.recordStepCompleted(
+          step,
+          "nonexistent-instance",
+          "OK",
+          [{ type: "STARTED", at: "2024-01-01T00:00:00Z" }],
+          [],
+          undefined,
+          0,
+          0,
+        ),
+      ).rejects.toThrow(ExecutorError);
+
+      try {
+        await writer.recordStepCompleted(
+          step,
+          "nonexistent-instance",
+          "OK",
+          [],
+          [],
+          undefined,
+          0,
+          0,
+        );
+      } catch (e) {
+        expect((e as ExecutorError).code).toBe("STEP_NOT_FOUND");
+      }
+    });
+
+    test("recordStepCompleted prefers RUNNING record when multiple exist", async () => {
+      const writer = new RunWriter({
+        store,
+        run_id: "test-run",
+        owner_id: "owner-1",
+        workflow: "plan",
+        args: {},
+        repo_hash: "abc123",
+        config: defaultConfig,
+      });
+      await writer.init();
+
+      const step = createMockStep({ id: "step-1" });
+
+      // Manually create a scenario with duplicate records (shouldn't happen normally)
+      // First record: RUNNING
+      await writer.recordStepStarted(step, "instance-1", "digest-1");
+
+      // Manually push another record with same instance_id but different status
+      // This simulates a corrupted state
+      const record = writer.getRunRecord();
+      record?.steps.push({
+        step_id: "step-1",
+        step_instance_id: "instance-1",
+        step_seq: 99,
+        name: "step-1",
+        status: "BLOCKED",
+        inputs_digest: "digest-1",
+        schema_version: "1.0",
+        events: [],
+        artifact_ids: [],
+        retry_count: 0,
+        repair_count: 0,
+        error_code: "HUMAN_REQUIRED",
+      });
+
+      // Now complete - should update the RUNNING one, not the BLOCKED one
+      await writer.recordStepCompleted(
+        step,
+        "instance-1",
+        "OK",
+        [{ type: "OK", at: "2024-01-01T00:00:00Z" }],
+        ["artifact-1"],
+        undefined,
+        0,
+        0,
+      );
+
+      const finalRecord = writer.getRunRecord();
+      const runningRecord = finalRecord?.steps.find(
+        (s) => s.step_seq === 1 && s.step_instance_id === "instance-1",
+      );
+      const blockedRecord = finalRecord?.steps.find(
+        (s) => s.step_seq === 99 && s.step_instance_id === "instance-1",
+      );
+
+      // The original RUNNING record (step_seq=1) should now be OK
+      expect(runningRecord?.status).toBe("OK");
+      // The other record should still be BLOCKED
+      expect(blockedRecord?.status).toBe("BLOCKED");
     });
   });
 });

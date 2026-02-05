@@ -283,6 +283,13 @@ Ordering for crash consistency:
 
 This makes crash recovery provably correct: step-result artifact is atomic proof of completion.
 
+**RunWriter idempotency:** RunWriter methods are idempotent for resume scenarios:
+- `recordStepStarted()`: No-op if `step_instance_id` already exists (prevents duplicate RUNNING records)
+- `recordStepSkipped()`: No-op if terminal record already exists (prevents duplicates for completed steps)
+- `recordStepCompleted()`: Prefers RUNNING record, throws `STEP_NOT_FOUND` if no match
+
+This ensures resume never creates duplicate or orphan StepRecords, even when re-running steps that were RUNNING at crash time.
+
 **SQLite atomicity:** Step-result artifact + RunRecord event append should be a single SQLite transaction (`BEGIN IMMEDIATE`) when possible. RunWriter serializes writes through one connection. Crash recovery logic handles edge cases where transaction isn't achievable.
 
 **Fan-out writes:** Multiple explorers finishing concurrently will race to persist. Serialize RunRecord writes through a single in-process RunWriter queue. Steps finish in any order; persistence is serialized. Steps publish events to RunWriter; only RunWriter mutates the RunRecord.
@@ -381,7 +388,11 @@ Use `storeArtifact()` wrapper which enforces TTL policy. Updates use optimistic 
 
 **Optimistic concurrency:** `expected_version` implies update — store rejects if version doesn't match or artifact not found. No race window between read and write.
 
-**VERSION_MISMATCH handling:** On conflict, single retry with warning log. If retry also fails, fail with error: "Run may be owned by another process." Conflicts are unexpected (RunWriter queue serializes in-process writes). Repeated conflicts indicate concurrent processes or bug — investigate, don't silently loop.
+**VERSION_MISMATCH handling:** On conflict, reload and single retry. After reload, re-validate invariants:
+- `owner_id` matches → throw `RUN_OWNED_BY_OTHER` if taken by another process
+- `status === "RUNNING"` → throw `RUN_ALREADY_COMPLETE` if finalized
+
+If retry also fails, throw error. Conflicts are unexpected (RunWriter queue serializes in-process writes). Repeated conflicts indicate concurrent processes or bug — investigate, don't silently loop.
 
 ### Idempotency
 

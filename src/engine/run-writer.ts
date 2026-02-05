@@ -135,6 +135,10 @@ export class RunWriter {
 
   /**
    * Record step STARTED (before execution).
+   *
+   * Idempotent: If step_instance_id already exists, no-op (resume scenario).
+   * This prevents duplicate StepRecords when re-running a step that was
+   * RUNNING at crash time.
    */
   async recordStepStarted(
     step: Step,
@@ -142,23 +146,33 @@ export class RunWriter {
     inputs_digest: string,
   ): Promise<void> {
     const now_ts = new Date().toISOString();
-    const stepSeq = this.nextStepSeq();
-
-    const stepRecord: StepRecord = {
-      step_id: step.id,
-      step_instance_id,
-      step_seq: stepSeq,
-      name: step.name,
-      status: "RUNNING",
-      inputs_digest,
-      schema_version: step.schema_version,
-      events: [{ type: "STARTED", at: now_ts }],
-      artifact_ids: [],
-      retry_count: 0,
-      repair_count: 0,
-    };
 
     await this.enqueueWrite((record) => {
+      // Check if step_instance_id already exists (resume scenario)
+      const existing = record.steps.find(
+        (s) => s.step_instance_id === step_instance_id,
+      );
+      if (existing) {
+        // Already recorded - no-op to prevent duplicates
+        // The existing record will be updated by recordStepCompleted()
+        return;
+      }
+
+      // Normal path: append new record
+      const stepSeq = this.nextStepSeq();
+      const stepRecord: StepRecord = {
+        step_id: step.id,
+        step_instance_id,
+        step_seq: stepSeq,
+        name: step.name,
+        status: "RUNNING",
+        inputs_digest,
+        schema_version: step.schema_version,
+        events: [{ type: "STARTED", at: now_ts }],
+        artifact_ids: [],
+        retry_count: 0,
+        repair_count: 0,
+      };
       record.steps.push(stepRecord);
       record.updated_at = now_ts;
     });
@@ -166,6 +180,9 @@ export class RunWriter {
 
   /**
    * Record step completion (OK/BLOCKED/FAILED).
+   *
+   * Prefers RUNNING record if multiple exist (defensive against duplicates).
+   * Throws if no matching record found.
    */
   async recordStepCompleted(
     _step: Step,
@@ -181,22 +198,38 @@ export class RunWriter {
     const now_ts = new Date().toISOString();
 
     await this.enqueueWrite((record) => {
-      const stepRecord = record.steps.find(
+      const matches = record.steps.filter(
         (s) => s.step_instance_id === step_instance_id,
       );
-      if (stepRecord) {
-        stepRecord.status = status;
-        stepRecord.events = events;
-        stepRecord.artifact_ids = artifact_ids;
-        if (actions && actions.length > 0) {
-          stepRecord.actions = actions;
-        }
-        stepRecord.retry_count = retry_count;
-        stepRecord.repair_count = repair_count;
-        if (error_code) {
-          // Type assertion needed since error_code comes from ErrorCode type
-          stepRecord.error_code = error_code as StepRecord["error_code"];
-        }
+
+      if (matches.length === 0) {
+        throw new ExecutorError(
+          "STEP_NOT_FOUND",
+          `No StepRecord found for step_instance_id ${step_instance_id}`,
+        );
+      }
+
+      if (matches.length > 1) {
+        console.warn(
+          `Multiple StepRecords for ${step_instance_id}, updating RUNNING one`,
+        );
+      }
+
+      // Prefer RUNNING record (normal case), fall back to first match
+      const stepRecord =
+        matches.find((s) => s.status === "RUNNING") ?? matches[0];
+
+      stepRecord.status = status;
+      stepRecord.events = events;
+      stepRecord.artifact_ids = artifact_ids;
+      if (actions && actions.length > 0) {
+        stepRecord.actions = actions;
+      }
+      stepRecord.retry_count = retry_count;
+      stepRecord.repair_count = repair_count;
+      if (error_code) {
+        // Type assertion needed since error_code comes from ErrorCode type
+        stepRecord.error_code = error_code as StepRecord["error_code"];
       }
       record.updated_at = now_ts;
     });
@@ -204,6 +237,10 @@ export class RunWriter {
 
   /**
    * Record step SKIPPED (idempotency hit).
+   *
+   * Idempotent: If step_instance_id already exists with terminal status, no-op.
+   * This prevents duplicate StepRecords when resuming a run that had
+   * completed steps before crash.
    */
   async recordStepSkipped(
     step: Step,
@@ -212,29 +249,43 @@ export class RunWriter {
     data: PersistedStepResult,
   ): Promise<void> {
     const now_ts = new Date().toISOString();
-    const stepSeq = this.nextStepSeq();
-
-    const stepRecord: StepRecord = {
-      step_id: step.id,
-      step_instance_id,
-      step_seq: stepSeq,
-      name: step.name,
-      status: data.status,
-      inputs_digest,
-      schema_version: step.schema_version,
-      events: [
-        { type: "STARTED", at: now_ts },
-        { type: "SKIPPED", at: now_ts, reason: "idempotent" },
-        { type: data.status, at: now_ts },
-      ],
-      artifact_ids: data.artifact_ids ?? [],
-      actions: "actions" in data ? data.actions : undefined,
-      retry_count: 0,
-      repair_count: 0,
-      error_code: "error" in data ? data.error : undefined,
-    };
 
     await this.enqueueWrite((record) => {
+      // Check if step_instance_id already exists with terminal status
+      const existing = record.steps.find(
+        (s) => s.step_instance_id === step_instance_id,
+      );
+      if (
+        existing &&
+        (existing.status === "OK" ||
+          existing.status === "BLOCKED" ||
+          existing.status === "FAILED")
+      ) {
+        // Already have terminal record - no-op to prevent duplicates
+        return;
+      }
+
+      // Normal path: append SKIPPED record
+      const stepSeq = this.nextStepSeq();
+      const stepRecord: StepRecord = {
+        step_id: step.id,
+        step_instance_id,
+        step_seq: stepSeq,
+        name: step.name,
+        status: data.status,
+        inputs_digest,
+        schema_version: step.schema_version,
+        events: [
+          { type: "STARTED", at: now_ts },
+          { type: "SKIPPED", at: now_ts, reason: "idempotent" },
+          { type: data.status, at: now_ts },
+        ],
+        artifact_ids: data.artifact_ids ?? [],
+        actions: "actions" in data ? data.actions : undefined,
+        retry_count: 0,
+        repair_count: 0,
+        error_code: "error" in data ? data.error : undefined,
+      };
       record.steps.push(stepRecord);
       record.updated_at = now_ts;
     });
@@ -431,7 +482,20 @@ export class RunWriter {
             if (existing) {
               const parsed = RunRecordSchema.safeParse(existing.data);
               if (parsed.success) {
-                // Reload latest persisted state and retry once.
+                // Re-check invariants after reload
+                if (parsed.data.owner_id !== this.owner_id) {
+                  throw new ExecutorError(
+                    "RUN_OWNED_BY_OTHER",
+                    `Run ${this.run_id} was taken by ${parsed.data.owner_id} during write`,
+                  );
+                }
+                if (parsed.data.status !== "RUNNING") {
+                  throw new ExecutorError(
+                    "RUN_ALREADY_COMPLETE",
+                    `Run ${this.run_id} was finalized (${parsed.data.status}) during write`,
+                  );
+                }
+                // Safe to reload and retry
                 this.runRecord = parsed.data;
                 this.currentVersion = existing.version;
                 continue;

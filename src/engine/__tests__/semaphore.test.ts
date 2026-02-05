@@ -90,14 +90,26 @@ describe("Semaphore", () => {
     expect(sem.available).toBe(2);
   });
 
-  test("over-release beyond initial permits is allowed", () => {
-    // This is harmless for our use case - document expected behavior
+  test("over-release beyond initial permits throws", () => {
     const sem = new Semaphore(1);
+    expect(() => sem.release()).toThrow(
+      "Semaphore over-release: already at max permits (1)",
+    );
+    expect(sem.available).toBe(1); // Unchanged
+  });
+
+  test("release after acquire returns to max, then throws on next", async () => {
+    const sem = new Semaphore(2);
+    await sem.acquire();
+    await sem.acquire();
+    expect(sem.available).toBe(0);
+
+    sem.release();
     sem.release();
     expect(sem.available).toBe(2);
 
-    sem.release();
-    expect(sem.available).toBe(3);
+    // Now at max - next release should throw
+    expect(() => sem.release()).toThrow("Semaphore over-release");
   });
 
   test("FIFO ordering for waiting acquires", async () => {

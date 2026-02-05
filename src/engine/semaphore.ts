@@ -4,6 +4,7 @@
  */
 export class Semaphore {
   private permits: number;
+  private readonly maxPermits: number;
   private waiting: Array<() => void> = [];
 
   constructor(permits: number) {
@@ -11,6 +12,7 @@ export class Semaphore {
       throw new Error("Semaphore permits must be >= 1");
     }
     this.permits = permits;
+    this.maxPermits = permits;
   }
 
   /**
@@ -26,12 +28,18 @@ export class Semaphore {
 
   /**
    * Release a permit. Wakes up a waiting acquirer if any.
+   * Throws if releasing would exceed initial permit count (indicates bug).
    */
   release(): void {
     const next = this.waiting.shift();
     if (next) {
       next();
     } else {
+      if (this.permits >= this.maxPermits) {
+        throw new Error(
+          `Semaphore over-release: already at max permits (${this.maxPermits})`,
+        );
+      }
       this.permits++;
     }
   }
