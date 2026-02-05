@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { SqliteArtifactStore } from "../../artifacts/sqlite.js";
 import type { ArtifactStore } from "../../artifacts/store.js";
 import type { StepRunnerResult } from "../../schemas/step-result.js";
-import type { BackoffConfig, Step, StepContext } from "../index.js";
+import type { BackoffConfig, Step, StepContext, StepOutput } from "../index.js";
 import {
   calculateBackoff,
   ExecutorError,
@@ -28,12 +29,15 @@ function createMockStep(overrides: Partial<Step> & { id: string }): Step {
   };
 }
 
-function createMockContext(overrides?: Partial<StepContext>): StepContext {
+function createMockContext(
+  store: ArtifactStore,
+  overrides?: Partial<StepContext>,
+): StepContext {
   return {
-    run_id: "test-run",
-    store: {} as ArtifactStore,
+    run_id: `test-run-${Math.random().toString(36).slice(2)}`,
+    store,
     config: { rounds: 2, retries: 2, timeout_ms: 60_000 },
-    artifacts: new Map(),
+    artifacts: new Map<string, StepOutput>(),
     repo_hash: "abc123",
     ...overrides,
   };
@@ -301,12 +305,16 @@ describe("calculateBackoff", () => {
 });
 
 describe("execute - success path", () => {
+  let store: SqliteArtifactStore;
+
   beforeEach(() => {
     vi.useFakeTimers();
+    store = new SqliteArtifactStore({ dbPath: ":memory:" });
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    store.close();
   });
 
   test("single step succeeds", async () => {
@@ -314,12 +322,15 @@ describe("execute - success path", () => {
       id: "step-a",
       run: async () => ({ status: "OK", artifact_ids: ["art-1"] }),
     });
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
 
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -357,11 +368,14 @@ describe("execute - success path", () => {
       },
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [c, b, a],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     await resultPromise;
@@ -379,23 +393,27 @@ describe("execute - success path", () => {
       deps: ["a"],
       run: async (ctx) => {
         // Check that a's artifacts are available
-        expect(ctx.artifacts.get("a")).toEqual({ artifact_ids: ["art-a"] });
+        const aOutput = ctx.artifacts.get("a");
+        expect(aOutput?.artifact_ids).toEqual(["art-a"]);
         return { status: "OK", artifact_ids: ["art-b"] };
       },
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [b, a],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
 
     expect(result.status).toBe("OK");
-    expect(ctx.artifacts.get("a")).toEqual({ artifact_ids: ["art-a"] });
-    expect(ctx.artifacts.get("b")).toEqual({ artifact_ids: ["art-b"] });
+    expect(ctx.artifacts.get("a")?.artifact_ids).toEqual(["art-a"]);
+    expect(ctx.artifacts.get("b")?.artifact_ids).toEqual(["art-b"]);
   });
 
   test("transient failures then success (retry recovery)", async () => {
@@ -412,11 +430,14 @@ describe("execute - success path", () => {
       },
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -427,12 +448,16 @@ describe("execute - success path", () => {
 });
 
 describe("execute - retry path", () => {
+  let store: SqliteArtifactStore;
+
   beforeEach(() => {
     vi.useFakeTimers();
+    store = new SqliteArtifactStore({ dbPath: ":memory:" });
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    store.close();
   });
 
   test("retries on RETRY result up to maxRetries", async () => {
@@ -446,11 +471,14 @@ describe("execute - retry path", () => {
       },
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -468,11 +496,14 @@ describe("execute - retry path", () => {
       run: async () => ({ status: "RETRY", error: "TIMEOUT" }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -495,11 +526,14 @@ describe("execute - retry path", () => {
       },
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -522,11 +556,14 @@ describe("execute - retry path", () => {
       },
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -542,12 +579,16 @@ describe("execute - retry path", () => {
 });
 
 describe("execute - SCHEMA_INVALID handling", () => {
+  let store: SqliteArtifactStore;
+
   beforeEach(() => {
     vi.useFakeTimers();
+    store = new SqliteArtifactStore({ dbPath: ":memory:" });
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    store.close();
   });
 
   test("SCHEMA_INVALID goes to BLOCKED immediately (no retries)", async () => {
@@ -561,11 +602,14 @@ describe("execute - SCHEMA_INVALID handling", () => {
       },
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -583,11 +627,14 @@ describe("execute - SCHEMA_INVALID handling", () => {
       run: async () => ({ status: "RETRY", error: "SCHEMA_INVALID" }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -600,12 +647,16 @@ describe("execute - SCHEMA_INVALID handling", () => {
 });
 
 describe("execute - timeout path", () => {
+  let store: SqliteArtifactStore;
+
   beforeEach(() => {
     vi.useFakeTimers();
+    store = new SqliteArtifactStore({ dbPath: ":memory:" });
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    store.close();
   });
 
   test("retries on timeout", async () => {
@@ -624,11 +675,14 @@ describe("execute - timeout path", () => {
       },
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
 
     // First attempt times out
@@ -656,11 +710,14 @@ describe("execute - timeout path", () => {
       },
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
 
     // First attempt times out
@@ -689,13 +746,16 @@ describe("execute - timeout path", () => {
     });
 
     // Config timeout is 60000ms but step timeout is 50ms
-    const ctx = createMockContext({
+    const ctx = createMockContext(store, {
       config: { rounds: 2, retries: 2, timeout_ms: 60000 },
     });
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
 
     // Step should timeout at 50ms, not 60000ms
@@ -708,12 +768,16 @@ describe("execute - timeout path", () => {
 });
 
 describe("execute - terminal states", () => {
+  let store: SqliteArtifactStore;
+
   beforeEach(() => {
     vi.useFakeTimers();
+    store = new SqliteArtifactStore({ dbPath: ":memory:" });
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    store.close();
   });
 
   test("stops on BLOCKED (does not execute downstream)", async () => {
@@ -739,11 +803,14 @@ describe("execute - terminal states", () => {
       },
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [b, a],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -776,11 +843,14 @@ describe("execute - terminal states", () => {
       },
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [b, a],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -801,11 +871,14 @@ describe("execute - terminal states", () => {
         }) as StepRunnerResult,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -816,13 +889,17 @@ describe("execute - terminal states", () => {
 });
 
 describe("execute - event recording", () => {
+  let store: SqliteArtifactStore;
+
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2024-01-01T00:00:00.000Z"));
+    store = new SqliteArtifactStore({ dbPath: ":memory:" });
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    store.close();
   });
 
   test("STARTED event recorded first", async () => {
@@ -831,11 +908,14 @@ describe("execute - event recording", () => {
       run: async () => ({ status: "OK", artifact_ids: [] }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -849,11 +929,14 @@ describe("execute - event recording", () => {
       run: async () => ({ status: "OK", artifact_ids: [] }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -873,11 +956,14 @@ describe("execute - event recording", () => {
         }) as StepRunnerResult,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -893,11 +979,14 @@ describe("execute - event recording", () => {
       run: async () => ({ status: "RETRY", error: "TIMEOUT" }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -920,11 +1009,14 @@ describe("execute - event recording", () => {
       },
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -940,11 +1032,14 @@ describe("execute - event recording", () => {
       run: async () => ({ status: "OK", artifact_ids: [] }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -956,17 +1051,28 @@ describe("execute - event recording", () => {
 });
 
 describe("execute - edge cases", () => {
+  let store: SqliteArtifactStore;
+
   beforeEach(() => {
     vi.useFakeTimers();
+    store = new SqliteArtifactStore({ dbPath: ":memory:" });
   });
 
   afterEach(() => {
     vi.useRealTimers();
+    store.close();
   });
 
   test("empty steps array returns OK with empty results", async () => {
-    const ctx = createMockContext();
-    const resultPromise = execute({ steps: [], ctx, backoff: FAST_BACKOFF });
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
+    });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
 
@@ -978,20 +1084,34 @@ describe("execute - edge cases", () => {
     const a = createMockStep({ id: "a", deps: ["b"] });
     const b = createMockStep({ id: "b", deps: ["a"] });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
 
     await expect(
-      execute({ steps: [a, b], ctx, backoff: FAST_BACKOFF }),
+      execute({
+        steps: [a, b],
+        ctx,
+        backoff: FAST_BACKOFF,
+        owner_id: "test-owner",
+        workflow: "plan",
+        args: {},
+      }),
     ).rejects.toThrow(ExecutorError);
   });
 
   test("throws on missing dependency", async () => {
     const a = createMockStep({ id: "a", deps: ["nonexistent"] });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
 
     await expect(
-      execute({ steps: [a], ctx, backoff: FAST_BACKOFF }),
+      execute({
+        steps: [a],
+        ctx,
+        backoff: FAST_BACKOFF,
+        owner_id: "test-owner",
+        workflow: "plan",
+        args: {},
+      }),
     ).rejects.toThrow(ExecutorError);
   });
 
@@ -1018,11 +1138,14 @@ describe("execute - edge cases", () => {
       jitter: 0,
     };
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: customBackoff,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -1043,11 +1166,14 @@ describe("execute - edge cases", () => {
       }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -1071,11 +1197,14 @@ describe("execute - edge cases", () => {
         }) as StepRunnerResult,
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -1091,11 +1220,14 @@ describe("execute - edge cases", () => {
       run: async () => ({ status: "OK", artifact_ids: [] }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -1113,11 +1245,14 @@ describe("execute - edge cases", () => {
       run: async () => ({ status: "OK", artifact_ids: [] }),
     });
 
-    const ctx = createMockContext();
+    const ctx = createMockContext(store);
     const resultPromise = execute({
       steps: [step],
       ctx,
       backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
     });
     await vi.runAllTimersAsync();
     const result = await resultPromise;
@@ -1125,6 +1260,230 @@ describe("execute - edge cases", () => {
     // Both should be 64-char hex strings (SHA-256)
     expect(result.step_results[0].inputs_digest).toMatch(/^[a-f0-9]{64}$/);
     expect(result.step_results[0].step_instance_id).toMatch(/^[a-f0-9]{64}$/);
+  });
+});
+
+describe("execute - parallel execution", () => {
+  let store: SqliteArtifactStore;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    store = new SqliteArtifactStore({ dbPath: ":memory:" });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    store.close();
+  });
+
+  test("independent steps run in parallel", async () => {
+    const startTimes: Record<string, number> = {};
+    const endTimes: Record<string, number> = {};
+
+    const a = createMockStep({
+      id: "a",
+      run: async () => {
+        startTimes.a = Date.now();
+        await new Promise((r) => setTimeout(r, 10));
+        endTimes.a = Date.now();
+        return { status: "OK", artifact_ids: [] };
+      },
+    });
+    const b = createMockStep({
+      id: "b",
+      run: async () => {
+        startTimes.b = Date.now();
+        await new Promise((r) => setTimeout(r, 10));
+        endTimes.b = Date.now();
+        return { status: "OK", artifact_ids: [] };
+      },
+    });
+    const c = createMockStep({
+      id: "c",
+      run: async () => {
+        startTimes.c = Date.now();
+        await new Promise((r) => setTimeout(r, 10));
+        endTimes.c = Date.now();
+        return { status: "OK", artifact_ids: [] };
+      },
+    });
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [a, b, c],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
+      concurrency: 3,
+    });
+    await vi.runAllTimersAsync();
+    const result = await resultPromise;
+
+    expect(result.status).toBe("OK");
+    expect(result.step_results).toHaveLength(3);
+
+    // All should start at roughly the same time (parallel)
+    const starts = Object.values(startTimes);
+    const maxStart = Math.max(...starts);
+    const minStart = Math.min(...starts);
+    expect(maxStart - minStart).toBeLessThan(5); // All started together
+  });
+
+  test("respects semaphore limit", async () => {
+    let concurrent = 0;
+    let maxConcurrent = 0;
+
+    const createStep = (id: string) =>
+      createMockStep({
+        id,
+        run: async () => {
+          concurrent++;
+          maxConcurrent = Math.max(maxConcurrent, concurrent);
+          await new Promise((r) => setTimeout(r, 10));
+          concurrent--;
+          return { status: "OK", artifact_ids: [] };
+        },
+      });
+
+    const steps = Array.from({ length: 6 }, (_, i) => createStep(`step-${i}`));
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps,
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
+      concurrency: 2, // Limit to 2 concurrent
+    });
+    await vi.runAllTimersAsync();
+    const result = await resultPromise;
+
+    expect(result.status).toBe("OK");
+    expect(maxConcurrent).toBeLessThanOrEqual(2);
+  });
+
+  test("respects dependency order across batches", async () => {
+    const order: string[] = [];
+
+    const a = createMockStep({
+      id: "a",
+      run: async () => {
+        order.push("a");
+        return { status: "OK", artifact_ids: [] };
+      },
+    });
+    const b = createMockStep({
+      id: "b",
+      deps: ["a"],
+      run: async () => {
+        order.push("b");
+        return { status: "OK", artifact_ids: [] };
+      },
+    });
+    const c = createMockStep({
+      id: "c",
+      deps: ["a"],
+      run: async () => {
+        order.push("c");
+        return { status: "OK", artifact_ids: [] };
+      },
+    });
+    const d = createMockStep({
+      id: "d",
+      deps: ["b", "c"],
+      run: async () => {
+        order.push("d");
+        return { status: "OK", artifact_ids: [] };
+      },
+    });
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [d, c, b, a],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
+    });
+    await vi.runAllTimersAsync();
+    const result = await resultPromise;
+
+    expect(result.status).toBe("OK");
+    // a must be first
+    expect(order.indexOf("a")).toBe(0);
+    // d must be last
+    expect(order.indexOf("d")).toBe(3);
+    // b and c after a, before d
+    expect(order.indexOf("b")).toBeGreaterThan(0);
+    expect(order.indexOf("b")).toBeLessThan(3);
+    expect(order.indexOf("c")).toBeGreaterThan(0);
+    expect(order.indexOf("c")).toBeLessThan(3);
+  });
+
+  test("stops at batch boundary on failure", async () => {
+    const executed: string[] = [];
+
+    const a = createMockStep({
+      id: "a",
+      run: async () => {
+        executed.push("a");
+        return { status: "OK", artifact_ids: [] };
+      },
+    });
+    const b = createMockStep({
+      id: "b",
+      deps: ["a"],
+      run: async () => {
+        executed.push("b");
+        return {
+          status: "FAILED",
+          artifact_ids: [],
+          error: "TOOL_ERROR_PERMANENT",
+        } as StepRunnerResult;
+      },
+    });
+    const c = createMockStep({
+      id: "c",
+      deps: ["a"],
+      run: async () => {
+        executed.push("c");
+        return { status: "OK", artifact_ids: [] };
+      },
+    });
+    const d = createMockStep({
+      id: "d",
+      deps: ["b", "c"],
+      run: async () => {
+        executed.push("d");
+        return { status: "OK", artifact_ids: [] };
+      },
+    });
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [d, c, b, a],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
+    });
+    await vi.runAllTimersAsync();
+    const result = await resultPromise;
+
+    expect(result.status).toBe("FAILED");
+    // a runs first (batch 0)
+    // b and c run together (batch 1), but b fails
+    // d should NOT run (batch 2 not started)
+    expect(executed).toContain("a");
+    expect(executed).toContain("b");
+    expect(executed).toContain("c"); // c completes since it started with b
+    expect(executed).not.toContain("d");
   });
 });
 

@@ -5,6 +5,12 @@ import type { StepRunnerResult } from "../schemas/step-result.js";
 /** Derived from RunRecord.config to avoid type drift */
 export type RunConfig = RunRecord["config"];
 
+/** Enhanced artifact output with versions for downstream idempotency */
+export interface StepOutput {
+  artifact_ids: string[];
+  versions: Record<string, number>; // artifact_id -> version (Record for JSON compat)
+}
+
 export const DEFAULT_RUN_CONFIG: Readonly<RunConfig> = {
   rounds: 2,
   retries: 2,
@@ -33,7 +39,7 @@ export interface StepContext {
   run_id: string;
   store: ArtifactStore;
   config: RunConfig;
-  artifacts: Map<string, unknown>; // outputs from completed deps
+  artifacts: Map<string, StepOutput>; // outputs from completed deps with versions
   repo_hash: string; // for steps to include in inputs
 }
 

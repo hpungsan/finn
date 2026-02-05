@@ -1,0 +1,393 @@
+import { ArtifactError, type ArtifactStore } from "../artifacts/index.js";
+import { getRunRecordTtl, storeArtifact } from "../policies/ttl.js";
+import {
+  type RunRecord,
+  RunRecordSchema,
+  type StepAction,
+  type StepEvent,
+  type StepRecord,
+} from "../schemas/run-record.js";
+import type { PersistedStepResult } from "../schemas/step-result.js";
+import { ExecutorError } from "./errors.js";
+import type { RunConfig, Step } from "./types.js";
+
+export interface RunWriterOpts {
+  store: ArtifactStore;
+  run_id: string;
+  owner_id: string;
+  workflow: "plan" | "feat" | "fix";
+  args: Record<string, unknown>;
+  repo_hash: string;
+  config: RunConfig;
+}
+
+export interface InitResult {
+  runRecord: RunRecord;
+  isResume: boolean; // true if existing RUNNING record found
+}
+
+/**
+ * Serializes RunRecord writes from concurrent step completions.
+ * Uses Promise chain for serialization and optimistic locking with single retry.
+ */
+export class RunWriter {
+  private stepSeq = 0; // Monotonic counter for step_seq
+  private currentVersion = 0; // For optimistic locking
+  private runRecord: RunRecord | null = null;
+  private writeQueue: Promise<void> = Promise.resolve();
+
+  private readonly store: ArtifactStore;
+  private readonly run_id: string;
+  private readonly owner_id: string;
+  private readonly workflow: "plan" | "feat" | "fix";
+  private readonly args: Record<string, unknown>;
+  private readonly repo_hash: string;
+  private readonly config: RunConfig;
+
+  constructor(opts: RunWriterOpts) {
+    this.store = opts.store;
+    this.run_id = opts.run_id;
+    this.owner_id = opts.owner_id;
+    this.workflow = opts.workflow;
+    this.args = opts.args;
+    this.repo_hash = opts.repo_hash;
+    this.config = opts.config;
+  }
+
+  /**
+   * Initialize new run or load existing for resume.
+   * - If no existing record: create new with status RUNNING
+   * - If existing with status RUNNING: resume mode (isResume=true)
+   * - If existing with terminal status: throw RUN_ALREADY_COMPLETE
+   * - If existing with different owner_id: throw RUN_OWNED_BY_OTHER
+   */
+  async init(): Promise<InitResult> {
+    const existing = await this.store.fetch({
+      workspace: "runs",
+      name: this.run_id,
+    });
+
+    if (!existing) {
+      // New run
+      const now = new Date().toISOString();
+      const runRecord: RunRecord = {
+        run_id: this.run_id,
+        owner_id: this.owner_id,
+        status: "RUNNING",
+        workflow: this.workflow,
+        args: this.args,
+        repo_hash: this.repo_hash,
+        config: this.config,
+        steps: [],
+        created_at: now,
+        updated_at: now,
+      };
+
+      const artifact = await storeArtifact(this.store, {
+        workspace: "runs",
+        name: this.run_id,
+        kind: "run-record",
+        data: runRecord,
+        ttl_seconds: getRunRecordTtl("FAILED"), // Conservative TTL until finalized
+      });
+
+      this.runRecord = runRecord;
+      this.currentVersion = artifact.version;
+      return { runRecord, isResume: false };
+    }
+
+    // Validate schema
+    const parsed = RunRecordSchema.safeParse(existing.data);
+    if (!parsed.success) {
+      throw new ExecutorError(
+        "INVALID_RUN_RECORD",
+        `Corrupted RunRecord: ${parsed.error.message}`,
+      );
+    }
+    const runRecord = parsed.data;
+
+    // Owner check
+    if (runRecord.owner_id !== this.owner_id) {
+      throw new ExecutorError(
+        "RUN_OWNED_BY_OTHER",
+        `Run ${this.run_id} owned by ${runRecord.owner_id}`,
+      );
+    }
+
+    // Status check
+    if (runRecord.status !== "RUNNING") {
+      throw new ExecutorError(
+        "RUN_ALREADY_COMPLETE",
+        `Run ${this.run_id} already ${runRecord.status}`,
+      );
+    }
+
+    // Resume mode - restore step_seq from existing steps
+    this.stepSeq =
+      runRecord.steps.length > 0
+        ? Math.max(...runRecord.steps.map((s) => s.step_seq))
+        : 0;
+    this.currentVersion = existing.version;
+    this.runRecord = runRecord;
+
+    return { runRecord, isResume: true };
+  }
+
+  /**
+   * Record step STARTED (before execution).
+   */
+  async recordStepStarted(
+    step: Step,
+    step_instance_id: string,
+    inputs_digest: string,
+  ): Promise<void> {
+    const now_ts = new Date().toISOString();
+    const stepSeq = this.nextStepSeq();
+
+    const stepRecord: StepRecord = {
+      step_id: step.id,
+      step_instance_id,
+      step_seq: stepSeq,
+      name: step.name,
+      status: "RUNNING",
+      inputs_digest,
+      schema_version: step.schema_version,
+      events: [{ type: "STARTED", at: now_ts }],
+      artifact_ids: [],
+      retry_count: 0,
+      repair_count: 0,
+    };
+
+    await this.enqueueWrite((record) => {
+      record.steps.push(stepRecord);
+      record.updated_at = now_ts;
+    });
+  }
+
+  /**
+   * Record step completion (OK/BLOCKED/FAILED).
+   */
+  async recordStepCompleted(
+    _step: Step,
+    step_instance_id: string,
+    status: "OK" | "BLOCKED" | "FAILED",
+    events: StepEvent[],
+    artifact_ids: string[],
+    actions: StepAction[] | undefined,
+    retry_count: number,
+    repair_count: number,
+    error_code?: string,
+  ): Promise<void> {
+    const now_ts = new Date().toISOString();
+
+    await this.enqueueWrite((record) => {
+      const stepRecord = record.steps.find(
+        (s) => s.step_instance_id === step_instance_id,
+      );
+      if (stepRecord) {
+        stepRecord.status = status;
+        stepRecord.events = events;
+        stepRecord.artifact_ids = artifact_ids;
+        if (actions && actions.length > 0) {
+          stepRecord.actions = actions;
+        }
+        stepRecord.retry_count = retry_count;
+        stepRecord.repair_count = repair_count;
+        if (error_code) {
+          // Type assertion needed since error_code comes from ErrorCode type
+          stepRecord.error_code = error_code as StepRecord["error_code"];
+        }
+      }
+      record.updated_at = now_ts;
+    });
+  }
+
+  /**
+   * Record step SKIPPED (idempotency hit).
+   */
+  async recordStepSkipped(
+    step: Step,
+    step_instance_id: string,
+    inputs_digest: string,
+    data: PersistedStepResult,
+  ): Promise<void> {
+    const now_ts = new Date().toISOString();
+    const stepSeq = this.nextStepSeq();
+
+    const stepRecord: StepRecord = {
+      step_id: step.id,
+      step_instance_id,
+      step_seq: stepSeq,
+      name: step.name,
+      status: data.status,
+      inputs_digest,
+      schema_version: step.schema_version,
+      events: [
+        { type: "STARTED", at: now_ts },
+        { type: "SKIPPED", at: now_ts, reason: "idempotent" },
+        { type: data.status, at: now_ts },
+      ],
+      artifact_ids: data.artifact_ids ?? [],
+      actions: "actions" in data ? data.actions : undefined,
+      retry_count: 0,
+      repair_count: 0,
+      error_code: "error" in data ? data.error : undefined,
+    };
+
+    await this.enqueueWrite((record) => {
+      record.steps.push(stepRecord);
+      record.updated_at = now_ts;
+    });
+  }
+
+  /**
+   * Record step RECOVERED (crash recovery from step-result artifact).
+   */
+  async recordStepRecovered(
+    _step: Step,
+    step_instance_id: string,
+    data: PersistedStepResult,
+  ): Promise<void> {
+    const now_ts = new Date().toISOString();
+
+    await this.enqueueWrite((record) => {
+      const stepRecord = record.steps.find(
+        (s) => s.step_instance_id === step_instance_id,
+      );
+      if (stepRecord) {
+        stepRecord.status = data.status;
+        stepRecord.events = [
+          ...stepRecord.events,
+          { type: "RECOVERED", at: now_ts },
+          { type: data.status, at: now_ts },
+        ];
+        stepRecord.artifact_ids = data.artifact_ids;
+        if ("actions" in data && data.actions) {
+          stepRecord.actions = data.actions;
+        }
+        if ("error" in data && data.error) {
+          stepRecord.error_code = data.error;
+        }
+      }
+      record.updated_at = now_ts;
+    });
+  }
+
+  /**
+   * Finalize run status.
+   */
+  async finalize(
+    status: "OK" | "BLOCKED" | "FAILED",
+    last_error?: string,
+  ): Promise<RunRecord> {
+    const now_ts = new Date().toISOString();
+
+    await this.enqueueWrite((record) => {
+      record.status = status;
+      record.updated_at = now_ts;
+      if (last_error) {
+        record.last_error = last_error as RunRecord["last_error"];
+      }
+    });
+
+    // Update TTL based on final status
+    const artifact = await this.store.store({
+      workspace: "runs",
+      name: this.run_id,
+      kind: "run-record",
+      // biome-ignore lint/style/noNonNullAssertion: runRecord is set after init()
+      data: this.runRecord!,
+      ttl_seconds: getRunRecordTtl(status),
+      expected_version: this.currentVersion,
+      mode: "replace",
+    });
+    this.currentVersion = artifact.version;
+
+    // biome-ignore lint/style/noNonNullAssertion: runRecord is set after init()
+    return this.runRecord!;
+  }
+
+  /**
+   * Get current in-memory record.
+   */
+  getRunRecord(): RunRecord | null {
+    return this.runRecord;
+  }
+
+  /**
+   * Get next step_seq (atomic increment).
+   */
+  nextStepSeq(): number {
+    return ++this.stepSeq;
+  }
+
+  /**
+   * Enqueue a write operation to be serialized.
+   * Uses optimistic locking with single retry on VERSION_MISMATCH.
+   */
+  private async enqueueWrite(
+    mutate: (record: RunRecord) => void,
+  ): Promise<void> {
+    this.writeQueue = this.writeQueue.then(async () => {
+      await this.persistWithRetry(mutate);
+    });
+
+    await this.writeQueue;
+  }
+
+  /**
+   * Persist RunRecord with single retry on VERSION_MISMATCH.
+   */
+  private async persistWithRetry(
+    mutate: (record: RunRecord) => void,
+  ): Promise<void> {
+    if (!this.runRecord) {
+      throw new Error("RunWriter not initialized");
+    }
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        // Clone so a failed optimistic write doesn't mutate in-memory state.
+        const next = structuredClone(this.runRecord);
+        mutate(next);
+
+        const artifact = await this.store.store({
+          workspace: "runs",
+          name: this.run_id,
+          kind: "run-record",
+          data: next,
+          ttl_seconds: getRunRecordTtl("FAILED"), // Conservative until finalized
+          expected_version: this.currentVersion,
+          mode: "replace",
+        });
+        this.runRecord = next;
+        this.currentVersion = artifact.version;
+        return;
+      } catch (e) {
+        if (e instanceof ArtifactError && e.code === "VERSION_MISMATCH") {
+          if (attempt === 0) {
+            // Reload and retry once
+            const existing = await this.store.fetch({
+              workspace: "runs",
+              name: this.run_id,
+            });
+            if (existing) {
+              const parsed = RunRecordSchema.safeParse(existing.data);
+              if (parsed.success) {
+                // Reload latest persisted state and retry once.
+                this.runRecord = parsed.data;
+                this.currentVersion = existing.version;
+                continue;
+              }
+            }
+          }
+          throw new ExecutorError(
+            "INVALID_RUN_RECORD",
+            "VERSION_MISMATCH after retry",
+          );
+        }
+        throw e;
+      }
+    }
+  }
+}

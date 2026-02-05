@@ -237,7 +237,7 @@ First-class abstraction for testable, replayable orchestration. Workflows define
 | `run_id` | Current workflow run identifier |
 | `store` | Artifact store for persistence |
 | `config` | Run configuration (rounds, retries, timeout_ms) |
-| `artifacts` | Outputs from completed deps (`Map<string, unknown>`) |
+| `artifacts` | Outputs from completed deps (`Map<string, StepOutput>`: `artifact_ids` + `versions`) |
 | `repo_hash` | Repository state for steps to include in inputs |
 
 **Why `getInputs()`:** Steps own their input computation. Enables testing input canonicalization without running LLMs.
@@ -247,7 +247,7 @@ First-class abstraction for testable, replayable orchestration. Workflows define
 - External side effects should be idempotent or use deduplication keys
 - Long-running steps should periodically check if they should abort (future: `AbortSignal` support)
 
-**Canonical implementation:** `src/engine/types.ts` — `Step`, `StepContext`, `StepInputs`, `RunConfig`, `ArtifactInputRef`, `StepVersioning`
+**Canonical implementation:** `src/engine/types.ts` — `Step`, `StepContext`, `StepInputs`, `StepOutput`, `RunConfig`, `ArtifactInputRef`, `StepVersioning`
 
 **Domain types:** `src/schemas/run-record.ts` (`StepRecord`, `RunRecord`) and `src/schemas/step-result.ts` (`StepRunnerResult`, `PersistedStepResult`)
 
@@ -335,7 +335,7 @@ Single source of truth for workflow execution. Scripts → platform.
 | `retry_count` / `repair_count` | Counters (derived from events) |
 | `trace` | Model, prompt_version, artifact_ids_read |
 
-**Event types:** STARTED, RETRY (with error + repair_attempt flag), OK, BLOCKED, FAILED
+**Event types:** STARTED, RETRY (with error + repair_attempt flag), OK, BLOCKED, FAILED, SKIPPED (idempotency hit), RECOVERED (crash recovery)
 
 **Status values:** PENDING, RUNNING, OK, RETRYING, BLOCKED, FAILED
 
@@ -759,8 +759,10 @@ finn/
 │   │   ├── index.ts          # Public exports
 │   │   ├── types.ts          # Step, StepContext, StepInputs, RunConfig
 │   │   ├── errors.ts         # ExecutorError (graph validation errors)
-│   │   ├── executor.ts       # Topo-sort, semaphore, Promise.allSettled
+│   │   ├── executor.ts       # Topo-sort, parallel batches, Promise.allSettled
 │   │   ├── run-writer.ts     # Serialized RunRecord writes
+│   │   ├── semaphore.ts      # Counting semaphore for concurrency
+│   │   ├── batch.ts          # Group steps by dependency level
 │   │   └── idempotency.ts    # step_instance_id computation
 │   ├── workflows/
 │   │   ├── plan.ts           # Plan: fan-out/fan-in/stitch

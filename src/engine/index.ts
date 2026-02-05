@@ -1,5 +1,7 @@
 // Types
 
+// Batch grouping
+export { groupIntoBatches } from "./batch.js";
 export type { ExecutorErrorCode } from "./errors.js";
 export { ExecutorError } from "./errors.js";
 export type {
@@ -9,10 +11,10 @@ export type {
   StepExecutionResult,
   TimeoutResult,
 } from "./executor.js";
-
 // Executor
 export {
   calculateBackoff,
+  collectVersions,
   DEFAULT_BACKOFF,
   execute,
   sleep,
@@ -28,12 +30,20 @@ export {
   normalizePath,
   stableStringify,
 } from "./idempotency.js";
+export type { InitResult, RunWriterOpts } from "./run-writer.js";
+// RunWriter
+export { RunWriter } from "./run-writer.js";
+// Semaphore
+export { Semaphore } from "./semaphore.js";
+
+// Types
 export type {
   ArtifactInputRef,
   RunConfig,
   Step,
   StepContext,
   StepInputs,
+  StepOutput,
   StepVersioning,
 } from "./types.js";
 export { DEFAULT_RUN_CONFIG } from "./types.js";
