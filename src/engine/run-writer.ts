@@ -401,9 +401,10 @@ export class RunWriter {
               error: stepRecord.error_code!,
             };
 
+      // Run-scoped naming ensures TTL alignment targets this run's step-results only
       await storeArtifact(this.store, {
         workspace: "runs",
-        name: stepRecord.step_instance_id,
+        name: `${this.run_id}-${stepRecord.step_instance_id}`,
         kind: "step-result",
         data,
         run_id: this.run_id,

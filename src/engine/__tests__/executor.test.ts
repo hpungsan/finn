@@ -1724,10 +1724,10 @@ describe("execute - step-result TTL alignment", () => {
     const result = await resultPromise;
 
     // After successful run, TTLs are aligned to 7 days
-    // But we can verify the artifact exists
+    // But we can verify the artifact exists (run-scoped naming)
     const stepResult = await store.fetch({
       workspace: "runs",
-      name: result.step_results[0].step_instance_id,
+      name: `${ctx.run_id}-${result.step_results[0].step_instance_id}`,
     });
     expect(stepResult).not.toBeNull();
   });
@@ -1769,7 +1769,7 @@ describe("execute - step-result TTL alignment", () => {
     // run_id must be preserved for step-results (alignment update should not clear it)
     const stepResult = await store.fetch({
       workspace: "runs",
-      name: result.step_results[0].step_instance_id,
+      name: `${ctx.run_id}-${result.step_results[0].step_instance_id}`,
     });
     expect(stepResult?.run_id).toBe(ctx.run_id);
   });

@@ -254,14 +254,15 @@ async function persistStepResult(
         };
 
   // Conservative TTL (30 days) during execution - aligned at finalize()
+  // Name is run-scoped to isolate crash recovery per-run
   await storeArtifact(store, {
     workspace: "runs",
-    name: step_instance_id,
+    name: `${run_id}-${step_instance_id}`,
     kind: "step-result",
     data,
     run_id,
     ttl_seconds: getRunRecordTtl("FAILED"), // Conservative until finalize
-    mode: "replace", // Idempotent
+    mode: "replace", // Idempotent for crash recovery within same run
   });
 }
 
@@ -284,10 +285,10 @@ async function checkIdempotencySkip(
     },
   );
 
-  // Check for existing step-result artifact
+  // Check for existing step-result artifact (run-scoped for crash recovery)
   const existing = await ctx.store.fetch({
     workspace: "runs",
-    name: step_instance_id,
+    name: `${ctx.run_id}-${step_instance_id}`,
   });
 
   if (!existing) return null;
@@ -370,9 +371,10 @@ async function recoverFromCrash(
     }
 
     // Check if step-result artifact exists (crash between step completion and RunRecord update)
+    // Run-scoped naming ensures we only recover from this run's step-results
     const stepResultArtifact = await ctx.store.fetch({
       workspace: "runs",
-      name: stepRecord.step_instance_id,
+      name: `${ctx.run_id}-${stepRecord.step_instance_id}`,
     });
 
     if (stepResultArtifact) {

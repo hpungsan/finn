@@ -271,10 +271,10 @@ Ordering for crash consistency:
 1. Record step RUNNING → **persist RunRecord**
 2. Run subagent
 3. Write output artifacts to store
-4. Write step-result artifact (`kind: "step-result"`, name: `step_instance_id`, run_id: `run_id`)
+4. Write step-result artifact (`kind: "step-result"`, name: `{run_id}-{step_instance_id}`)
 5. Record step OK/BLOCKED/FAILED → **persist RunRecord**
 
-**Note:** Step-results must include `run_id` even though name is `step_instance_id`. This enables listing all step-results for a run, GC by run TTL, and debugging without knowing every step_instance_id.
+**Note:** Step-results are run-scoped (`{run_id}-{step_instance_id}`) to isolate crash recovery per-run. This prevents cross-run interference where different runs could overwrite each other's step-results.
 
 **Crash recovery:** If crash between (4) and (5), on resume:
 - Step shows RUNNING in RunRecord
@@ -300,7 +300,7 @@ This ensures resume never creates duplicate or orphan StepRecords, even when re-
 - Audit metadata, not correctness-critical
 
 **Inputs canonicalization:** `inputs_digest` must be deterministic and change if any upstream output changes. Before hashing:
-- Include `repo_hash` for steps that read from the repo (ensures cross-run caching is only valid when repo state matches)
+- Include `repo_hash` for steps that read from the repo (ensures idempotency keys reflect repo state; prerequisite for any future cross-run caching)
 - Include artifact `version` in refs, not just name/id (detects upstream changes even if name unchanged)
 - Sort artifact refs by `(workspace, name ?? id)`
 - Sort file lists alphabetically
@@ -410,11 +410,12 @@ step_instance_id = hash(step_id + inputs_digest + model + schema_version + promp
 | `schema_version` | Output schema version |
 | `prompt_version` | Prompt template version |
 
-**Behavior:** Before running any step, check if step-result artifact exists for `step_instance_id` → skip.
+**Behavior:** Before running any step, check if step-result artifact exists for `{run_id}-{step_instance_id}` → skip.
+
+**Scope:** Step-results are run-scoped for crash recovery within the same run. Cross-run caching is not supported in v1 because LLM outputs are non-deterministic (same inputs ≠ same outputs) and artifact_ids are ULIDs (not content-addressed).
 
 **Enables:**
-- Resume after crash (same inputs → same instance_id → skip completed)
-- Replay for debugging (deterministic)
+- Resume after crash (same run, same inputs → skip completed step)
 - Model change forces re-run (different model → new instance_id)
 - Schema change forces re-run (different schema_version → new instance_id)
 - Prompt change forces re-run (different prompt_version → new instance_id)
@@ -562,12 +563,12 @@ The artifact store has a ceiling (200K chars for data, 12K for text). Finn enfor
 | `verifier-output` | `feat` | `{run_id}-{role}-r{N}` | 2 hours |
 | `design-spec` | `feat` | `{run_id}-design` | 2 hours |
 | `run-record` | `runs` | `{run_id}` | 7d / 30d |
-| `step-result` | `runs` | `{step_instance_id}` | Aligned to run at finalize |
+| `step-result` | `runs` | `{run_id}-{step_instance_id}` | Aligned to run at finalize |
 | `dlq-entry` | `dlq` | `{run_id}` | persistent |
 
 **Naming conventions:**
 - Round suffix `-r{N}` when role runs multiple times (e.g., `verifier-r1`, `verifier-r2`)
-- Step-result keyed by `step_instance_id` (the idempotency hash) for crash recovery lookup
+- Step-result keyed by `{run_id}-{step_instance_id}` for run-isolated crash recovery
 
 **Step-result TTL alignment:** Step-results are stored with conservative 30-day TTL during execution (for crash recovery). At run finalization, TTLs are aligned to match the run's final status:
 - **OK run** → step-results downgraded to 7 days
