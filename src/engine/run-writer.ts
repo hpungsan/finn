@@ -274,7 +274,12 @@ export class RunWriter {
   }
 
   /**
-   * Finalize run status.
+   * Finalize run status and align step-result TTLs.
+   *
+   * Step-results are stored with conservative 30-day TTL during execution.
+   * At finalize, we align all step-result TTLs to match the run's final TTL:
+   * - OK run → 7 days (downgrade from 30)
+   * - BLOCKED/FAILED run → 30 days (no change needed)
    */
   async finalize(
     status: "OK" | "BLOCKED" | "FAILED",
@@ -291,20 +296,72 @@ export class RunWriter {
     });
 
     // Update TTL based on final status
+    const finalTtl = getRunRecordTtl(status);
     const artifact = await this.store.store({
       workspace: "runs",
       name: this.run_id,
       kind: "run-record",
       // biome-ignore lint/style/noNonNullAssertion: runRecord is set after init()
       data: this.runRecord!,
-      ttl_seconds: getRunRecordTtl(status),
+      ttl_seconds: finalTtl,
       expected_version: this.currentVersion,
       mode: "replace",
     });
     this.currentVersion = artifact.version;
 
+    // Align step-result TTLs to match run TTL
+    // Only needed for OK runs (downgrade from 30d to 7d)
+    // BLOCKED/FAILED already have 30d TTL
+    if (status === "OK") {
+      await this.alignStepResultTtls(finalTtl);
+    }
+
     // biome-ignore lint/style/noNonNullAssertion: runRecord is set after init()
     return this.runRecord!;
+  }
+
+  /**
+   * Align all step-result artifact TTLs to match the run's final TTL.
+   * Reconstructs PersistedStepResult from StepRecord to avoid extra fetches.
+   */
+  private async alignStepResultTtls(ttlSeconds: number): Promise<void> {
+    if (!this.runRecord) return;
+
+    // Only align terminal steps (skip RUNNING - shouldn't exist at finalize)
+    const terminalSteps = this.runRecord.steps.filter(
+      (s) =>
+        s.status === "OK" || s.status === "BLOCKED" || s.status === "FAILED",
+    );
+
+    const updates = terminalSteps.map(async (stepRecord) => {
+      // Reconstruct PersistedStepResult from StepRecord
+      const data =
+        stepRecord.status === "OK"
+          ? {
+              status: "OK" as const,
+              artifact_ids: stepRecord.artifact_ids,
+              actions: stepRecord.actions,
+            }
+          : {
+              status: stepRecord.status as "BLOCKED" | "FAILED",
+              artifact_ids: stepRecord.artifact_ids,
+              actions: stepRecord.actions,
+              // biome-ignore lint/style/noNonNullAssertion: error_code guaranteed for BLOCKED/FAILED steps
+              error: stepRecord.error_code!,
+            };
+
+      await storeArtifact(this.store, {
+        workspace: "runs",
+        name: stepRecord.step_instance_id,
+        kind: "step-result",
+        data,
+        run_id: this.run_id,
+        ttl_seconds: ttlSeconds,
+        mode: "replace",
+      });
+    });
+
+    await Promise.all(updates);
   }
 
   /**

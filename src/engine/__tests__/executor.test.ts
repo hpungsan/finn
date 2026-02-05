@@ -1510,3 +1510,354 @@ describe("sleep", () => {
     expect(resolved).toBe(true);
   });
 });
+
+describe("execute - AbortSignal cooperative cancellation", () => {
+  let store: SqliteArtifactStore;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    store = new SqliteArtifactStore({ dbPath: ":memory:" });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    store.close();
+  });
+
+  test("signal passed to step.run()", async () => {
+    let receivedSignal: AbortSignal | undefined;
+    const step = createMockStep({
+      id: "step-a",
+      run: async (ctx) => {
+        receivedSignal = ctx.signal;
+        return { status: "OK", artifact_ids: [] };
+      },
+    });
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [step],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
+    });
+    await vi.runAllTimersAsync();
+    await resultPromise;
+
+    expect(receivedSignal).toBeInstanceOf(AbortSignal);
+    expect(receivedSignal?.aborted).toBe(false);
+  });
+
+  test("signal aborted on timeout", async () => {
+    let capturedSignal: AbortSignal | undefined;
+    const step = createMockStep({
+      id: "step-a",
+      timeout: 100,
+      maxRetries: 0,
+      run: async (ctx) => {
+        capturedSignal = ctx.signal;
+        // Never resolve - will timeout
+        await new Promise(() => {});
+        return { status: "OK", artifact_ids: [] };
+      },
+    });
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [step],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
+    });
+
+    // Wait for timeout
+    await vi.advanceTimersByTimeAsync(100);
+    const result = await resultPromise;
+
+    expect(result.status).toBe("FAILED");
+    expect(result.step_results[0].error_code).toBe("TIMEOUT");
+    // Signal should have been aborted
+    expect(capturedSignal?.aborted).toBe(true);
+  });
+
+  test("signal aborted before retry on RETRY result", async () => {
+    const signals: AbortSignal[] = [];
+    let attempts = 0;
+
+    const step = createMockStep({
+      id: "step-a",
+      maxRetries: 2,
+      run: async (ctx) => {
+        if (ctx.signal) signals.push(ctx.signal);
+        attempts++;
+        if (attempts < 2) {
+          return { status: "RETRY", error: "RATE_LIMIT" };
+        }
+        return { status: "OK", artifact_ids: [] };
+      },
+    });
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [step],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
+    });
+    await vi.runAllTimersAsync();
+    await resultPromise;
+
+    expect(signals).toHaveLength(2);
+    // First attempt's signal should be aborted before retry
+    expect(signals[0].aborted).toBe(true);
+    // Second attempt's signal should not be aborted (step succeeded)
+    expect(signals[1].aborted).toBe(false);
+  });
+
+  test("signal aborted on thrown exception before retry", async () => {
+    const signals: AbortSignal[] = [];
+    let attempts = 0;
+
+    const step = createMockStep({
+      id: "step-a",
+      maxRetries: 2,
+      run: async (ctx) => {
+        if (ctx.signal) signals.push(ctx.signal);
+        attempts++;
+        if (attempts < 2) {
+          throw new Error("Network error");
+        }
+        return { status: "OK", artifact_ids: [] };
+      },
+    });
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [step],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
+    });
+    await vi.runAllTimersAsync();
+    await resultPromise;
+
+    expect(signals).toHaveLength(2);
+    // First attempt's signal should be aborted after exception
+    expect(signals[0].aborted).toBe(true);
+    // Second attempt's signal should not be aborted
+    expect(signals[1].aborted).toBe(false);
+  });
+
+  test("each retry gets fresh AbortController", async () => {
+    const signals: AbortSignal[] = [];
+    let attempts = 0;
+
+    const step = createMockStep({
+      id: "step-a",
+      maxRetries: 3,
+      run: async (ctx) => {
+        if (ctx.signal) signals.push(ctx.signal);
+        attempts++;
+        if (attempts < 3) {
+          return { status: "RETRY", error: "TIMEOUT" };
+        }
+        return { status: "OK", artifact_ids: [] };
+      },
+    });
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [step],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
+    });
+    await vi.runAllTimersAsync();
+    await resultPromise;
+
+    // Each attempt should get a unique signal
+    expect(signals).toHaveLength(3);
+    expect(signals[0]).not.toBe(signals[1]);
+    expect(signals[1]).not.toBe(signals[2]);
+  });
+});
+
+describe("execute - step-result TTL alignment", () => {
+  let store: SqliteArtifactStore;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    store = new SqliteArtifactStore({ dbPath: ":memory:" });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    store.close();
+  });
+
+  test("step-results have conservative TTL (30d) during execution", async () => {
+    const step = createMockStep({
+      id: "step-a",
+      run: async () => ({ status: "OK", artifact_ids: [] }),
+    });
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [step],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
+    });
+    await vi.runAllTimersAsync();
+    const result = await resultPromise;
+
+    // After successful run, TTLs are aligned to 7 days
+    // But we can verify the artifact exists
+    const stepResult = await store.fetch({
+      workspace: "runs",
+      name: result.step_results[0].step_instance_id,
+    });
+    expect(stepResult).not.toBeNull();
+  });
+
+  test("successful run aligns step-result TTLs to 7 days", async () => {
+    // Track TTL values at store() calls
+    const ttlValues: number[] = [];
+    const originalStore = store.store.bind(store);
+    vi.spyOn(store, "store").mockImplementation(async (opts) => {
+      if (opts.kind === "step-result") {
+        ttlValues.push(opts.ttl_seconds as number);
+      }
+      return originalStore(opts);
+    });
+
+    const step = createMockStep({
+      id: "step-a",
+      run: async () => ({ status: "OK", artifact_ids: [] }),
+    });
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [step],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
+    });
+    await vi.runAllTimersAsync();
+    const result = await resultPromise;
+
+    expect(result.status).toBe("OK");
+    // First store: conservative 30d, second store: aligned 7d
+    expect(ttlValues).toHaveLength(2);
+    expect(ttlValues[0]).toBe(30 * 24 * 3600); // 30 days
+    expect(ttlValues[1]).toBe(7 * 24 * 3600); // 7 days
+
+    // run_id must be preserved for step-results (alignment update should not clear it)
+    const stepResult = await store.fetch({
+      workspace: "runs",
+      name: result.step_results[0].step_instance_id,
+    });
+    expect(stepResult?.run_id).toBe(ctx.run_id);
+  });
+
+  test("failed run keeps step-result TTLs at 30 days", async () => {
+    const ttlValues: number[] = [];
+    const originalStore = store.store.bind(store);
+    vi.spyOn(store, "store").mockImplementation(async (opts) => {
+      if (opts.kind === "step-result") {
+        ttlValues.push(opts.ttl_seconds as number);
+      }
+      return originalStore(opts);
+    });
+
+    const step = createMockStep({
+      id: "step-a",
+      maxRetries: 0,
+      run: async () =>
+        ({
+          status: "FAILED",
+          artifact_ids: [],
+          error: "TOOL_ERROR_PERMANENT",
+        }) as StepRunnerResult,
+    });
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [step],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
+    });
+    await vi.runAllTimersAsync();
+    const result = await resultPromise;
+
+    expect(result.status).toBe("FAILED");
+    // Only one store for step-result (no alignment needed for failed runs)
+    expect(ttlValues).toHaveLength(1);
+    expect(ttlValues[0]).toBe(30 * 24 * 3600); // 30 days
+  });
+
+  test("all step-results aligned on successful multi-step run", async () => {
+    const stepResultTtls: Record<string, number[]> = {};
+    const originalStore = store.store.bind(store);
+    vi.spyOn(store, "store").mockImplementation(async (opts) => {
+      if (opts.kind === "step-result") {
+        const name = opts.name as string;
+        if (!stepResultTtls[name]) stepResultTtls[name] = [];
+        stepResultTtls[name].push(opts.ttl_seconds as number);
+      }
+      return originalStore(opts);
+    });
+
+    const a = createMockStep({
+      id: "a",
+      run: async () => ({ status: "OK", artifact_ids: [] }),
+    });
+    const b = createMockStep({
+      id: "b",
+      deps: ["a"],
+      run: async () => ({ status: "OK", artifact_ids: [] }),
+    });
+    const c = createMockStep({
+      id: "c",
+      deps: ["b"],
+      run: async () => ({ status: "OK", artifact_ids: [] }),
+    });
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [c, b, a],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
+    });
+    await vi.runAllTimersAsync();
+    const result = await resultPromise;
+
+    expect(result.status).toBe("OK");
+    // Each step-result should have been stored twice (conservative, then aligned)
+    for (const ttls of Object.values(stepResultTtls)) {
+      expect(ttls).toHaveLength(2);
+      expect(ttls[0]).toBe(30 * 24 * 3600); // Conservative
+      expect(ttls[1]).toBe(7 * 24 * 3600); // Aligned
+    }
+  });
+});

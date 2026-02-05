@@ -227,6 +227,10 @@ export async function collectVersions(
 
 /**
  * Persist step result as artifact for idempotency.
+ *
+ * Uses conservative 30-day TTL during execution. TTLs are aligned to
+ * match the run's final TTL at finalize() - this ensures step-results
+ * never expire before the run-record they belong to.
  */
 async function persistStepResult(
   store: ArtifactStore,
@@ -249,13 +253,14 @@ async function persistStepResult(
           error: result.error_code!,
         };
 
+  // Conservative TTL (30 days) during execution - aligned at finalize()
   await storeArtifact(store, {
     workspace: "runs",
     name: step_instance_id,
     kind: "step-result",
     data,
     run_id,
-    ttl_seconds: getRunRecordTtl(result.status),
+    ttl_seconds: getRunRecordTtl("FAILED"), // Conservative until finalize
     mode: "replace", // Idempotent
   });
 }
@@ -415,6 +420,7 @@ async function recoverFromCrash(
  * - Catches thrown exceptions, treats as TOOL_ERROR_TRANSIENT
  * - SCHEMA_INVALID → BLOCKED immediately (no retries, per FINN.md)
  * - Records events for each state transition
+ * - Creates AbortController per attempt for cooperative cancellation
  */
 async function runStep(
   step: Step,
@@ -440,11 +446,21 @@ async function runStep(
   while (true) {
     let result: StepRunnerResult;
 
+    // Create AbortController for this attempt - enables cooperative cancellation
+    const controller = new AbortController();
+    const ctxWithSignal: StepContext = { ...ctx, signal: controller.signal };
+
     try {
-      const timeoutResult = await withTimeout(step.run(ctx), step.timeout);
+      const timeoutResult = await withTimeout(
+        step.run(ctxWithSignal),
+        step.timeout,
+      );
 
       // Handle timeout
       if (timeoutResult.type === "timeout") {
+        // Signal cooperative cancellation before retry
+        controller.abort();
+
         if (retry_count >= step.maxRetries) {
           events.push({ type: "FAILED", at: new Date().toISOString() });
           return {
@@ -471,6 +487,9 @@ async function runStep(
 
       result = timeoutResult.value;
     } catch {
+      // Signal cooperative cancellation on error
+      controller.abort();
+
       // step.run() threw - treat as transient error
       // Note: Steps should return { status: "FAILED", error: "TOOL_ERROR_PERMANENT" }
       // for permanent errors. Throws are assumed transient (network issues, etc.)
@@ -545,6 +564,10 @@ async function runStep(
             error_code: result.error,
           };
         }
+
+        // Signal cooperative cancellation before retry
+        controller.abort();
+
         events.push({
           type: "RETRY",
           at: new Date().toISOString(),

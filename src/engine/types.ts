@@ -41,6 +41,7 @@ export interface StepContext {
   config: RunConfig;
   artifacts: Map<string, StepOutput>; // outputs from completed deps with versions
   repo_hash: string; // for steps to include in inputs
+  signal?: AbortSignal; // cooperative cancellation on timeout/retry
 }
 
 export interface Step<_T = unknown> {
@@ -59,8 +60,13 @@ export interface Step<_T = unknown> {
   /**
    * Execute the step.
    *
-   * Idempotency contract: On timeout, the executor retries without cancelling
-   * the in-flight attempt. Multiple run() calls may overlap. Steps must handle this:
+   * Cancellation contract: The executor provides `ctx.signal` (AbortSignal) for
+   * cooperative cancellation. On timeout or before retry, the signal is aborted.
+   * Steps SHOULD check `ctx.signal?.aborted` periodically and exit early when true.
+   * Steps that ignore the signal will continue running in the background.
+   *
+   * Idempotency contract: Multiple run() calls may overlap if a step ignores
+   * the abort signal. Steps must handle this:
    * - Use optimistic locking for artifact writes
    * - External side effects should be idempotent
    */

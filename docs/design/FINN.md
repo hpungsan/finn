@@ -239,13 +239,15 @@ First-class abstraction for testable, replayable orchestration. Workflows define
 | `config` | Run configuration (rounds, retries, timeout_ms) |
 | `artifacts` | Outputs from completed deps (`Map<string, StepOutput>`: `artifact_ids` + `versions`) |
 | `repo_hash` | Repository state for steps to include in inputs |
+| `signal` | `AbortSignal` for cooperative cancellation on timeout/retry (optional) |
 
 **Why `getInputs()`:** Steps own their input computation. Enables testing input canonicalization without running LLMs.
 
-**Step idempotency contract:** When a step times out, the executor retries without cancelling the in-flight attempt. This means multiple executions of `run()` may overlap. Steps must be designed to handle this:
+**Step cancellation contract:** The executor provides `ctx.signal` (`AbortSignal`) for cooperative cancellation. On timeout or before retry, the signal is aborted. Steps SHOULD check `ctx.signal?.aborted` periodically and exit early when true. Steps that ignore the signal will continue running in the background (the executor moves on without waiting).
+
+**Step idempotency contract:** Multiple executions of `run()` may overlap if a step ignores the abort signal. Steps must be designed to handle this:
 - Artifact writes use optimistic locking (`expected_version`) — concurrent writes fail safely
 - External side effects should be idempotent or use deduplication keys
-- Long-running steps should periodically check if they should abort (future: `AbortSignal` support)
 
 **Canonical implementation:** `src/engine/types.ts` — `Step`, `StepContext`, `StepInputs`, `StepOutput`, `RunConfig`, `ArtifactInputRef`, `StepVersioning`
 
@@ -549,12 +551,18 @@ The artifact store has a ceiling (200K chars for data, 12K for text). Finn enfor
 | `verifier-output` | `feat` | `{run_id}-{role}-r{N}` | 2 hours |
 | `design-spec` | `feat` | `{run_id}-design` | 2 hours |
 | `run-record` | `runs` | `{run_id}` | 7d / 30d |
-| `step-result` | `runs` | `{step_instance_id}` | Same as run |
+| `step-result` | `runs` | `{step_instance_id}` | Aligned to run at finalize |
 | `dlq-entry` | `dlq` | `{run_id}` | persistent |
 
 **Naming conventions:**
 - Round suffix `-r{N}` when role runs multiple times (e.g., `verifier-r1`, `verifier-r2`)
 - Step-result keyed by `step_instance_id` (the idempotency hash) for crash recovery lookup
+
+**Step-result TTL alignment:** Step-results are stored with conservative 30-day TTL during execution (for crash recovery). At run finalization, TTLs are aligned to match the run's final status:
+- **OK run** → step-results downgraded to 7 days
+- **BLOCKED/FAILED run** → step-results remain at 30 days (no change needed)
+
+This ensures step-results never expire before the run-record they belong to.
 
 ### Phase Tracking
 
