@@ -84,7 +84,7 @@ interface Artifact<T = unknown> {
   // Lifecycle
   version: number;               // optimistic concurrency (starts at 1)
   ttl_seconds?: number;          // time-to-live (undefined = no expiry)
-  expires_at?: number;           // computed: created_at + ttl_seconds (ms)
+  expires_at?: number;           // computed at write time: now_ms + (ttl_seconds * 1000)
   created_at: number;            // Unix timestamp (ms)
   updated_at: number;            // Unix timestamp (ms)
   deleted_at?: number;           // soft delete timestamp (ms)

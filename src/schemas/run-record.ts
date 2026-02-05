@@ -31,6 +31,8 @@ const StepEventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("OK"), at: z.string() }),
   z.object({ type: z.literal("BLOCKED"), at: z.string() }),
   z.object({ type: z.literal("FAILED"), at: z.string() }),
+  z.object({ type: z.literal("SKIPPED"), at: z.string(), reason: z.string() }),
+  z.object({ type: z.literal("RECOVERED"), at: z.string() }),
 ]);
 
 // Exported for reuse in step-result.ts

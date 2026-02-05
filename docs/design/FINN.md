@@ -237,17 +237,19 @@ First-class abstraction for testable, replayable orchestration. Workflows define
 | `run_id` | Current workflow run identifier |
 | `store` | Artifact store for persistence |
 | `config` | Run configuration (rounds, retries, timeout_ms) |
-| `artifacts` | Outputs from completed deps (`Map<string, unknown>`) |
+| `artifacts` | Outputs from completed deps (`Map<string, StepOutput>`: `artifact_ids` + `versions`) |
 | `repo_hash` | Repository state for steps to include in inputs |
+| `signal` | `AbortSignal` for cooperative cancellation on timeout/retry (optional) |
 
 **Why `getInputs()`:** Steps own their input computation. Enables testing input canonicalization without running LLMs.
 
-**Step idempotency contract:** When a step times out, the executor retries without cancelling the in-flight attempt. This means multiple executions of `run()` may overlap. Steps must be designed to handle this:
+**Step cancellation contract:** The executor provides `ctx.signal` (`AbortSignal`) for cooperative cancellation. On timeout or before retry, the signal is aborted. Steps SHOULD check `ctx.signal?.aborted` periodically and exit early when true. Steps that ignore the signal will continue running in the background (the executor moves on without waiting).
+
+**Step idempotency contract:** Multiple executions of `run()` may overlap if a step ignores the abort signal. Steps must be designed to handle this:
 - Artifact writes use optimistic locking (`expected_version`) — concurrent writes fail safely
 - External side effects should be idempotent or use deduplication keys
-- Long-running steps should periodically check if they should abort (future: `AbortSignal` support)
 
-**Canonical implementation:** `src/engine/types.ts` — `Step`, `StepContext`, `StepInputs`, `RunConfig`, `ArtifactInputRef`, `StepVersioning`
+**Canonical implementation:** `src/engine/types.ts` — `Step`, `StepContext`, `StepInputs`, `StepOutput`, `RunConfig`, `ArtifactInputRef`, `StepVersioning`
 
 **Domain types:** `src/schemas/run-record.ts` (`StepRecord`, `RunRecord`) and `src/schemas/step-result.ts` (`StepRunnerResult`, `PersistedStepResult`)
 
@@ -269,10 +271,10 @@ Ordering for crash consistency:
 1. Record step RUNNING → **persist RunRecord**
 2. Run subagent
 3. Write output artifacts to store
-4. Write step-result artifact (`kind: "step-result"`, name: `step_instance_id`, run_id: `run_id`)
+4. Write step-result artifact (`kind: "step-result"`, name: `{run_id}-{step_instance_id}`)
 5. Record step OK/BLOCKED/FAILED → **persist RunRecord**
 
-**Note:** Step-results must include `run_id` even though name is `step_instance_id`. This enables listing all step-results for a run, GC by run TTL, and debugging without knowing every step_instance_id.
+**Note:** Step-results are run-scoped (`{run_id}-{step_instance_id}`) to isolate crash recovery per-run. This prevents cross-run interference where different runs could overwrite each other's step-results.
 
 **Crash recovery:** If crash between (4) and (5), on resume:
 - Step shows RUNNING in RunRecord
@@ -280,6 +282,13 @@ Ordering for crash consistency:
 - Engine finalizes RunRecord from step-result → no rerun
 
 This makes crash recovery provably correct: step-result artifact is atomic proof of completion.
+
+**RunWriter idempotency:** RunWriter methods are idempotent for resume scenarios:
+- `recordStepStarted()`: No-op if `step_instance_id` already exists (prevents duplicate RUNNING records)
+- `recordStepSkipped()`: No-op if terminal record already exists (prevents duplicates for completed steps)
+- `recordStepCompleted()`: Prefers RUNNING record, throws `STEP_NOT_FOUND` if no match
+
+This ensures resume never creates duplicate or orphan StepRecords, even when re-running steps that were RUNNING at crash time.
 
 **SQLite atomicity:** Step-result artifact + RunRecord event append should be a single SQLite transaction (`BEGIN IMMEDIATE`) when possible. RunWriter serializes writes through one connection. Crash recovery logic handles edge cases where transaction isn't achievable.
 
@@ -291,7 +300,7 @@ This makes crash recovery provably correct: step-result artifact is atomic proof
 - Audit metadata, not correctness-critical
 
 **Inputs canonicalization:** `inputs_digest` must be deterministic and change if any upstream output changes. Before hashing:
-- Include `repo_hash` for steps that read from the repo (ensures cross-run caching is only valid when repo state matches)
+- Include `repo_hash` for steps that read from the repo (ensures idempotency keys reflect repo state; prerequisite for any future cross-run caching)
 - Include artifact `version` in refs, not just name/id (detects upstream changes even if name unchanged)
 - Sort artifact refs by `(workspace, name ?? id)`
 - Sort file lists alphabetically
@@ -335,7 +344,7 @@ Single source of truth for workflow execution. Scripts → platform.
 | `retry_count` / `repair_count` | Counters (derived from events) |
 | `trace` | Model, prompt_version, artifact_ids_read |
 
-**Event types:** STARTED, RETRY (with error + repair_attempt flag), OK, BLOCKED, FAILED
+**Event types:** STARTED, RETRY (with error + repair_attempt flag), OK, BLOCKED, FAILED, SKIPPED (idempotency hit), RECOVERED (crash recovery)
 
 **Status values:** PENDING, RUNNING, OK, RETRYING, BLOCKED, FAILED
 
@@ -379,7 +388,11 @@ Use `storeArtifact()` wrapper which enforces TTL policy. Updates use optimistic 
 
 **Optimistic concurrency:** `expected_version` implies update — store rejects if version doesn't match or artifact not found. No race window between read and write.
 
-**VERSION_MISMATCH handling:** On conflict, single retry with warning log. If retry also fails, fail with error: "Run may be owned by another process." Conflicts are unexpected (RunWriter queue serializes in-process writes). Repeated conflicts indicate concurrent processes or bug — investigate, don't silently loop.
+**VERSION_MISMATCH handling:** On conflict, reload and single retry. After reload, re-validate invariants:
+- `owner_id` matches → throw `RUN_OWNED_BY_OTHER` if taken by another process
+- `status === "RUNNING"` → throw `RUN_ALREADY_COMPLETE` if finalized
+
+If retry also fails, throw error. Conflicts are unexpected (RunWriter queue serializes in-process writes). Repeated conflicts indicate concurrent processes or bug — investigate, don't silently loop.
 
 ### Idempotency
 
@@ -397,11 +410,12 @@ step_instance_id = hash(step_id + inputs_digest + model + schema_version + promp
 | `schema_version` | Output schema version |
 | `prompt_version` | Prompt template version |
 
-**Behavior:** Before running any step, check if step-result artifact exists for `step_instance_id` → skip.
+**Behavior:** Before running any step, check if step-result artifact exists for `{run_id}-{step_instance_id}` → skip.
+
+**Scope:** Step-results are run-scoped for crash recovery within the same run. Cross-run caching is not supported in v1 because LLM outputs are non-deterministic (same inputs ≠ same outputs) and artifact_ids are ULIDs (not content-addressed).
 
 **Enables:**
-- Resume after crash (same inputs → same instance_id → skip completed)
-- Replay for debugging (deterministic)
+- Resume after crash (same run, same inputs → skip completed step)
 - Model change forces re-run (different model → new instance_id)
 - Schema change forces re-run (different schema_version → new instance_id)
 - Prompt change forces re-run (different prompt_version → new instance_id)
@@ -549,12 +563,18 @@ The artifact store has a ceiling (200K chars for data, 12K for text). Finn enfor
 | `verifier-output` | `feat` | `{run_id}-{role}-r{N}` | 2 hours |
 | `design-spec` | `feat` | `{run_id}-design` | 2 hours |
 | `run-record` | `runs` | `{run_id}` | 7d / 30d |
-| `step-result` | `runs` | `{step_instance_id}` | Same as run |
+| `step-result` | `runs` | `{run_id}-{step_instance_id}` | Aligned to run at finalize |
 | `dlq-entry` | `dlq` | `{run_id}` | persistent |
 
 **Naming conventions:**
 - Round suffix `-r{N}` when role runs multiple times (e.g., `verifier-r1`, `verifier-r2`)
-- Step-result keyed by `step_instance_id` (the idempotency hash) for crash recovery lookup
+- Step-result keyed by `{run_id}-{step_instance_id}` for run-isolated crash recovery
+
+**Step-result TTL alignment:** Step-results are stored with conservative 30-day TTL during execution (for crash recovery). At run finalization, TTLs are aligned to match the run's final status:
+- **OK run** → step-results downgraded to 7 days
+- **BLOCKED/FAILED run** → step-results remain at 30 days (no change needed)
+
+This ensures step-results never expire before the run-record they belong to.
 
 ### Phase Tracking
 
@@ -759,8 +779,10 @@ finn/
 │   │   ├── index.ts          # Public exports
 │   │   ├── types.ts          # Step, StepContext, StepInputs, RunConfig
 │   │   ├── errors.ts         # ExecutorError (graph validation errors)
-│   │   ├── executor.ts       # Topo-sort, semaphore, Promise.allSettled
+│   │   ├── executor.ts       # Topo-sort, parallel batches, Promise.allSettled
 │   │   ├── run-writer.ts     # Serialized RunRecord writes
+│   │   ├── semaphore.ts      # Counting semaphore for concurrency
+│   │   ├── batch.ts          # Group steps by dependency level
 │   │   └── idempotency.ts    # step_instance_id computation
 │   ├── workflows/
 │   │   ├── plan.ts           # Plan: fan-out/fan-in/stitch

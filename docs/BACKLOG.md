@@ -44,6 +44,23 @@ function renderArtifact(kind: string, data: unknown): string {
 
 ---
 
+#### Cross-Run Caching
+
+Skip step execution when inputs match a previous run. Separate from crash recovery (per-run step-result).
+
+**Status:** Deferred for v1 — step-results are run-scoped for crash recovery, and naive cross-run caching is incorrect for LLM steps + ULID artifact pointers.
+
+**Design (if implemented):**
+- New artifact kind: `step-cache` (global, keyed by `step_instance_id`)
+- On cache hit: materialize artifacts into current run (copy with new ULIDs, run-scoped names)
+- Write per-run step-result pointing to this run's artifact IDs
+- Per-step `cache_policy`: `"never"` (default for LLM) | `"deterministic"` | `"allow"`
+- Concurrency-safe writes: `mode: "error"` on cache population (no clobber)
+
+**When to add:** After /plan works end-to-end, if cost savings justify complexity. Only correct for pure/deterministic steps.
+
+---
+
 #### Per-Tool Rate Limits
 
 Base has semaphore concurrency for steps. Add per-tool rate limits for commands/search that may have stricter API limits.
