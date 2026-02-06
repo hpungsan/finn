@@ -44,6 +44,23 @@ function renderArtifact(kind: string, data: unknown): string {
 
 ---
 
+#### Atomic Step-Result + RunRecord Writes
+
+Currently, `persistStepResult()` and `recordStepCompleted()` are separate store calls. Per FINN.md, these should ideally be a single SQLite transaction (`BEGIN IMMEDIATE`) to eliminate the crash window where step-result exists but RunRecord not updated.
+
+**Current behavior:** Split writes with crash recovery handling the edge case (step-result exists → RECOVERED event on resume).
+
+**Enhancement:** Bundle step-result into RunRecord write OR expose transaction primitives from ArtifactStore.
+
+**Trade-offs:**
+- Bundling bloats RunRecord with step-result data
+- Transaction primitives add ArtifactStore complexity
+- Current crash recovery is correct, just not atomic
+
+**When to add:** If atomicity guarantees become important for external consumers of run state. Not blocking — crash recovery handles the failure mode correctly.
+
+---
+
 #### Cross-Run Caching
 
 Skip step execution when inputs match a previous run. Separate from crash recovery (per-run step-result).

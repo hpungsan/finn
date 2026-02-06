@@ -1,5 +1,6 @@
 import type { ArtifactStore } from "../artifacts/store.js";
 import { getRunRecordTtl, storeArtifact } from "../policies/ttl.js";
+import type { DlqEntry } from "../schemas/dlq-entry.js";
 import type {
   ErrorCode,
   StepAction,
@@ -268,22 +269,15 @@ async function persistStepResult(
 
 /**
  * Check if step can be skipped due to existing step-result.
+ * Accepts precomputed idempotency values to avoid redundant getInputs() calls.
  */
-async function checkIdempotencySkip(
+async function checkIdempotencySkipWithPrecomputed(
   step: Step,
   ctx: StepContext,
   writer: RunWriter,
+  precomputed: PrecomputedIdempotency,
 ): Promise<StepExecutionResult | null> {
-  const inputs = step.getInputs(ctx);
-  const { inputs_digest, step_instance_id } = computeStepIdempotency(
-    step.id,
-    inputs,
-    {
-      model: step.model,
-      prompt_version: step.prompt_version,
-      schema_version: step.schema_version,
-    },
-  );
+  const { inputs_digest, step_instance_id } = precomputed;
 
   // Check for existing step-result artifact (run-scoped for crash recovery)
   const existing = await ctx.store.fetch({
@@ -364,10 +358,14 @@ async function recoverFromCrash(
   for (const stepRecord of runningSteps) {
     const step = stepMap.get(stepRecord.step_id);
     if (!step) {
-      console.warn(
-        `Step ${stepRecord.step_id} in RunRecord but not in step definitions`,
+      // Fail-fast: RUNNING step references unknown definition
+      // This indicates workflow changed incompatibly between crash and resume
+      throw new ExecutorError(
+        "STEP_DEFINITION_MISMATCH",
+        `Step ${stepRecord.step_id} in RunRecord but not in step definitions. ` +
+          `Cannot safely resume - workflow definition may have changed.`,
+        { step_id: stepRecord.step_id, run_id: ctx.run_id },
       );
-      continue;
     }
 
     // Check if step-result artifact exists (crash between step completion and RunRecord update)
@@ -413,6 +411,12 @@ async function recoverFromCrash(
   }
 }
 
+/** Precomputed idempotency values to avoid recomputing getInputs() */
+interface PrecomputedIdempotency {
+  inputs_digest: string;
+  step_instance_id: string;
+}
+
 /**
  * Execute a single step with retry loop.
  *
@@ -423,22 +427,15 @@ async function recoverFromCrash(
  * - SCHEMA_INVALID → BLOCKED immediately (no retries, per FINN.md)
  * - Records events for each state transition
  * - Creates AbortController per attempt for cooperative cancellation
+ * - Accepts precomputed idempotency values to avoid redundant getInputs() calls
  */
 async function runStep(
   step: Step,
   ctx: StepContext,
   backoff: BackoffConfig,
+  precomputed: PrecomputedIdempotency,
 ): Promise<StepExecutionResult> {
-  const inputs = step.getInputs(ctx);
-  const { inputs_digest, step_instance_id } = computeStepIdempotency(
-    step.id,
-    inputs,
-    {
-      model: step.model,
-      prompt_version: step.prompt_version,
-      schema_version: step.schema_version,
-    },
-  );
+  const { inputs_digest, step_instance_id } = precomputed;
 
   const events: StepEvent[] = [];
   let retry_count = 0;
@@ -614,6 +611,9 @@ async function runStep(
 
 /**
  * Run step with semaphore for concurrency control.
+ *
+ * Accepts precomputed idempotency values from checkBatchIdempotency to avoid
+ * redundant getInputs() calls. Values are computed once per step.
  */
 async function runStepWithSemaphore(
   step: Step,
@@ -621,25 +621,17 @@ async function runStepWithSemaphore(
   sem: Semaphore,
   writer: RunWriter,
   backoff: BackoffConfig,
+  precomputed: PrecomputedIdempotency,
 ): Promise<StepExecutionResult> {
   await sem.acquire();
   try {
-    const inputs = step.getInputs(ctx);
-    const { inputs_digest, step_instance_id } = computeStepIdempotency(
-      step.id,
-      inputs,
-      {
-        model: step.model,
-        prompt_version: step.prompt_version,
-        schema_version: step.schema_version,
-      },
-    );
+    const { inputs_digest, step_instance_id } = precomputed;
 
     // Record step started
     await writer.recordStepStarted(step, step_instance_id, inputs_digest);
 
-    // Run the step
-    const result = await runStep(step, ctx, backoff);
+    // Run the step with precomputed values
+    const result = await runStep(step, ctx, backoff, precomputed);
 
     // Persist step result for idempotency
     await persistStepResult(ctx.store, ctx.run_id, step_instance_id, result);
@@ -663,19 +655,47 @@ async function runStepWithSemaphore(
   }
 }
 
+/** Step with precomputed idempotency values for execution */
+interface StepWithIdempotency {
+  step: Step;
+  precomputed: PrecomputedIdempotency;
+}
+
 /**
  * Check idempotency for batch of steps, separating toRun from skipped.
+ * Returns precomputed idempotency values for toRun steps to avoid recomputation.
  */
 async function checkBatchIdempotency(
   batch: Step[],
   ctx: StepContext,
   writer: RunWriter,
-): Promise<{ toRun: Step[]; skipped: StepExecutionResult[] }> {
-  const toRun: Step[] = [];
+): Promise<{ toRun: StepWithIdempotency[]; skipped: StepExecutionResult[] }> {
+  const toRun: StepWithIdempotency[] = [];
   const skipped: StepExecutionResult[] = [];
 
   for (const step of batch) {
-    const skipResult = await checkIdempotencySkip(step, ctx, writer);
+    // Compute idempotency once - reused for skip check and execution
+    const inputs = step.getInputs(ctx);
+    const { inputs_digest, step_instance_id } = computeStepIdempotency(
+      step.id,
+      inputs,
+      {
+        model: step.model,
+        prompt_version: step.prompt_version,
+        schema_version: step.schema_version,
+      },
+    );
+    const precomputed: PrecomputedIdempotency = {
+      inputs_digest,
+      step_instance_id,
+    };
+
+    const skipResult = await checkIdempotencySkipWithPrecomputed(
+      step,
+      ctx,
+      writer,
+      precomputed,
+    );
     if (skipResult) {
       skipped.push(skipResult);
       // Populate ctx.artifacts for skipped steps too
@@ -688,7 +708,7 @@ async function checkBatchIdempotency(
         versions,
       });
     } else {
-      toRun.push(step);
+      toRun.push({ step, precomputed });
     }
   }
 
@@ -733,7 +753,42 @@ export async function execute(opts: ExecuteOpts): Promise<ExecuteResult> {
   // 3. Init and handle crash recovery (automatic detection)
   const { isResume } = await writer.init();
   if (isResume) {
-    await recoverFromCrash(writer, ctx, sortedSteps);
+    try {
+      await recoverFromCrash(writer, ctx, sortedSteps);
+    } catch (e) {
+      // On definition mismatch, finalize as BLOCKED and create DLQ entry
+      if (e instanceof ExecutorError && e.code === "STEP_DEFINITION_MISMATCH") {
+        // Ensure the run record does not retain orphan RUNNING steps.
+        await writer.blockRunningSteps("STEP_DEFINITION_MISMATCH");
+        await writer.finalize("BLOCKED", "STEP_DEFINITION_MISMATCH");
+
+        // Create DLQ entry for investigation/resume
+        const runRecord = writer.getRunRecord();
+        const dlqEntry: DlqEntry = {
+          workflow,
+          failed_step: e.details?.step_id,
+          inputs: args,
+          retry_count: 0,
+          last_error: "STEP_DEFINITION_MISMATCH",
+          partial_results: runRecord?.steps
+            .filter((s) => s.status === "OK")
+            .flatMap((s) => s.artifact_ids),
+          summary: e.message,
+        };
+
+        await storeArtifact(ctx.store, {
+          workspace: "dlq",
+          name: ctx.run_id,
+          kind: "dlq-entry",
+          data: dlqEntry,
+          run_id: ctx.run_id,
+          mode: "replace",
+        });
+
+        throw e; // Re-throw so caller knows
+      }
+      throw e;
+    }
   }
 
   // 4. Create semaphore
@@ -763,15 +818,15 @@ export async function execute(opts: ExecuteOpts): Promise<ExecuteResult> {
     if (failedStep) break;
 
     // Run remaining steps with Promise.allSettled
-    const batchPromises = toRun.map((step) =>
-      runStepWithSemaphore(step, ctx, sem, writer, backoff),
+    const batchPromises = toRun.map(({ step, precomputed }) =>
+      runStepWithSemaphore(step, ctx, sem, writer, backoff, precomputed),
     );
     const settled = await Promise.allSettled(batchPromises);
 
     // Process results, update ctx.artifacts with versions
     for (let i = 0; i < settled.length; i++) {
       const result = settled[i];
-      const step = toRun[i];
+      const { step, precomputed } = toRun[i];
 
       if (result.status === "fulfilled") {
         const stepResult = result.value;
@@ -799,8 +854,8 @@ export async function execute(opts: ExecuteOpts): Promise<ExecuteResult> {
         // Promise rejected (shouldn't happen with our error handling, but handle gracefully)
         const errorResult: StepExecutionResult = {
           step_id: step.id,
-          step_instance_id: "",
-          inputs_digest: "",
+          step_instance_id: precomputed.step_instance_id,
+          inputs_digest: precomputed.inputs_digest,
           status: "FAILED",
           events: [
             { type: "STARTED", at: new Date().toISOString() },
@@ -828,6 +883,32 @@ export async function execute(opts: ExecuteOpts): Promise<ExecuteResult> {
     ? (step_results.find((r) => r.step_id === failedStep)?.status ?? "FAILED")
     : "OK";
   await writer.finalize(finalStatus, finalError);
+
+  // 7. Create DLQ entry for failed/blocked runs
+  if (finalStatus !== "OK" && failedStep && finalError) {
+    const runRecord = writer.getRunRecord();
+    const failedResult = step_results.find((r) => r.step_id === failedStep);
+    const dlqEntry: DlqEntry = {
+      workflow,
+      failed_step: failedStep,
+      inputs: args,
+      retry_count: failedResult?.retry_count ?? 0,
+      last_error: finalError,
+      partial_results: runRecord?.steps
+        .filter((s) => s.status === "OK")
+        .flatMap((s) => s.artifact_ids),
+      summary: `Step ${failedStep} failed with ${finalError} after ${failedResult?.retry_count ?? 0} retries`,
+    };
+
+    await storeArtifact(ctx.store, {
+      workspace: "dlq",
+      name: ctx.run_id,
+      kind: "dlq-entry",
+      data: dlqEntry,
+      run_id: ctx.run_id,
+      mode: "replace",
+    });
+  }
 
   return {
     status: finalStatus,

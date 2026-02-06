@@ -1,6 +1,7 @@
 import { ArtifactError, type ArtifactStore } from "../artifacts/index.js";
 import { getRunRecordTtl, storeArtifact } from "../policies/ttl.js";
 import {
+  type ErrorCode,
   type RunRecord,
   RunRecordSchema,
   type StepAction,
@@ -9,6 +10,7 @@ import {
 } from "../schemas/run-record.js";
 import type { PersistedStepResult } from "../schemas/step-result.js";
 import { ExecutorError } from "./errors.js";
+import { applyEventFold } from "./event-fold.js";
 import type { RunConfig, Step } from "./types.js";
 
 export interface RunWriterOpts {
@@ -105,6 +107,11 @@ export class RunWriter {
       );
     }
     const runRecord = parsed.data;
+
+    // Event sourcing: derive status/retry_count/repair_count from events
+    for (const step of runRecord.steps) {
+      applyEventFold(step);
+    }
 
     // Owner check
     if (runRecord.owner_id !== this.owner_id) {
@@ -305,20 +312,50 @@ export class RunWriter {
       const stepRecord = record.steps.find(
         (s) => s.step_instance_id === step_instance_id,
       );
-      if (stepRecord) {
-        stepRecord.status = data.status;
+      if (!stepRecord) {
+        // Invariant violation: step_instance_id came from this record's steps
+        throw new ExecutorError(
+          "STEP_NOT_FOUND",
+          `recordStepRecovered: step_instance_id ${step_instance_id} not found in RunRecord`,
+          { step_instance_id, run_id: this.run_id },
+        );
+      }
+
+      stepRecord.status = data.status;
+      stepRecord.events = [
+        ...stepRecord.events,
+        { type: "RECOVERED", at: now_ts },
+        { type: data.status, at: now_ts },
+      ];
+      stepRecord.artifact_ids = data.artifact_ids;
+      if ("actions" in data && data.actions) {
+        stepRecord.actions = data.actions;
+      }
+      if ("error" in data && data.error) {
+        stepRecord.error_code = data.error;
+      }
+      record.updated_at = now_ts;
+    });
+  }
+
+  /**
+   * Block all RUNNING steps in the RunRecord.
+   *
+   * Used when recovery cannot proceed (e.g., step definition mismatch) to ensure
+   * finalized runs do not contain orphan RUNNING steps.
+   */
+  async blockRunningSteps(error_code: ErrorCode): Promise<void> {
+    const now_ts = new Date().toISOString();
+
+    await this.enqueueWrite((record) => {
+      for (const stepRecord of record.steps) {
+        if (stepRecord.status !== "RUNNING") continue;
+        stepRecord.status = "BLOCKED";
+        stepRecord.error_code = error_code;
         stepRecord.events = [
           ...stepRecord.events,
-          { type: "RECOVERED", at: now_ts },
-          { type: data.status, at: now_ts },
+          { type: "BLOCKED", at: now_ts },
         ];
-        stepRecord.artifact_ids = data.artifact_ids;
-        if ("actions" in data && data.actions) {
-          stepRecord.actions = data.actions;
-        }
-        if ("error" in data && data.error) {
-          stepRecord.error_code = data.error;
-        }
       }
       record.updated_at = now_ts;
     });
@@ -337,6 +374,24 @@ export class RunWriter {
     last_error?: string,
   ): Promise<RunRecord> {
     const now_ts = new Date().toISOString();
+
+    // Invariant: no RUNNING steps at finalize.
+    //
+    // Important: check before persisting any finalize changes to avoid partially
+    // finalized runs (e.g., terminal run status with RUNNING steps).
+    // Callers must use blockRunningSteps() before finalize() if steps may be orphaned.
+    const runningSteps = this.runRecord?.steps.filter(
+      (s) => s.status === "RUNNING",
+    );
+    if (runningSteps && runningSteps.length > 0) {
+      const stepIds = runningSteps.map((s) => s.step_id).join(", ");
+      throw new ExecutorError(
+        "INVARIANT_VIOLATION",
+        `Cannot finalize: ${runningSteps.length} steps still RUNNING: ${stepIds}. ` +
+          `Call blockRunningSteps() before finalize() to handle orphaned steps.`,
+        { run_id: this.run_id },
+      );
+    }
 
     await this.enqueueWrite((record) => {
       record.status = status;
@@ -378,7 +433,7 @@ export class RunWriter {
   private async alignStepResultTtls(ttlSeconds: number): Promise<void> {
     if (!this.runRecord) return;
 
-    // Only align terminal steps (skip RUNNING - shouldn't exist at finalize)
+    // Only align terminal steps (RUNNING steps are blocked by blockRunningSteps before finalize)
     const terminalSteps = this.runRecord.steps.filter(
       (s) =>
         s.status === "OK" || s.status === "BLOCKED" || s.status === "FAILED",
@@ -498,6 +553,9 @@ export class RunWriter {
                 }
                 // Safe to reload and retry
                 this.runRecord = parsed.data;
+                for (const step of this.runRecord.steps) {
+                  applyEventFold(step);
+                }
                 this.currentVersion = existing.version;
                 continue;
               }

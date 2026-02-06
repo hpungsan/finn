@@ -181,6 +181,7 @@ Machine-checkable gating, not markdown regex.
 - `src/schemas/explorer-finding.ts` — `ExplorerFindingSchema`
 - `src/schemas/run-record.ts` — `RunRecordSchema`, `ErrorCodeSchema`, `StatusSchema`
 - `src/schemas/step-result.ts` — `StepRunnerResultSchema`, `PersistedStepResultSchema`
+- `src/schemas/dlq-entry.ts` — `DlqEntrySchema`
 
 ### Timeout + Retry Policy
 
@@ -287,8 +288,20 @@ This makes crash recovery provably correct: step-result artifact is atomic proof
 - `recordStepStarted()`: No-op if `step_instance_id` already exists (prevents duplicate RUNNING records)
 - `recordStepSkipped()`: No-op if terminal record already exists (prevents duplicates for completed steps)
 - `recordStepCompleted()`: Prefers RUNNING record, throws `STEP_NOT_FOUND` if no match
+- `recordStepRecovered()`: Throws `STEP_NOT_FOUND` if step_instance_id not found (invariant violation)
 
 This ensures resume never creates duplicate or orphan StepRecords, even when re-running steps that were RUNNING at crash time.
+
+**Definition mismatch on resume:** If a RUNNING StepRecord references a step_id not in the current step definitions, recovery:
+1. Finalizes the run as `BLOCKED` with error `STEP_DEFINITION_MISMATCH`
+2. Creates a DLQ entry with partial results (completed steps' artifacts)
+3. Throws `STEP_DEFINITION_MISMATCH` to the caller
+
+Additionally, all RUNNING StepRecords are converted to `BLOCKED` with `error_code: STEP_DEFINITION_MISMATCH` so finalized runs do not contain orphan RUNNING steps.
+
+**Invariant enforced:** `finalize()` throws `INVARIANT_VIOLATION` if any RUNNING steps remain. Callers must use `blockRunningSteps()` before `finalize()` when steps may be orphaned (e.g., definition mismatch, unrecoverable errors).
+
+This prevents orphan RUNNING runs and provides structured recovery path. Causes: workflow definition changed between crash and resume, or wrong workflow invoked for resume.
 
 **SQLite atomicity:** Step-result artifact + RunRecord event append should be a single SQLite transaction (`BEGIN IMMEDIATE`) when possible. RunWriter serializes writes through one connection. Crash recovery logic handles edge cases where transaction isn't achievable.
 
@@ -368,7 +381,9 @@ RETRY is internal to the engine loop — only terminal states are persisted as `
 
 **Canonical implementation:** `src/schemas/step-result.ts` — `StepRunnerResultSchema`, `PersistedStepResultSchema`
 
-**Event sourcing:** `events` is the source of truth. `status` and `retry_count` are derived on load by folding events. This ensures crash recovery correctness — no stale cached state.
+**Event sourcing:** `events` is the source of truth. `status`, `retry_count`, and `repair_count` are derived on load by folding events via `applyEventFold()`. Denormalized fields are still written for debugging, but overwritten on every load. `error_code` is excluded from the fold (events don't carry it; write-only). Drift between stored and derived values is logged via `console.debug`.
+
+**Canonical implementation:** `src/engine/event-fold.ts` — `foldEvents()`, `applyEventFold()`. Applied in `RunWriter.init()` (resume) and `persistWithRetry()` (VERSION_MISMATCH reload).
 
 **Enables:**
 - DLQ with resume point
@@ -464,10 +479,17 @@ Per-step action log for audit trail and resume correctness.
 When a workflow fails after retries exhausted, store failure state for later resumption.
 
 **DLQ Entry:** Stored as artifact (`kind: "dlq-entry"`) in `workspace: "dlq"` (persistent, no TTL):
-- `data`: `workflow`, `task`, `failed_step`, `inputs`, `retry_count`, `last_error`, `relevant_files`, `partial_results`
+- `data`: `workflow`, `task`, `failed_step`, `inputs`, `retry_count`, `last_error`, `relevant_files`, `partial_results`, `summary`
 - `run_id`: from artifact metadata (not duplicated in data)
 - `failed_at`: use artifact's `created_at`
-- `text`: human-readable failure summary (optional, for debugging)
+
+**Canonical implementation:** `src/schemas/dlq-entry.ts` — `DlqEntrySchema`
+
+**DLQ triggers (automatic):**
+- Step fails/blocks after retries exhausted → DLQ entry with `retry_count`, `last_error`, `partial_results`
+- `STEP_DEFINITION_MISMATCH` on resume → DLQ entry with blocked step info
+
+DLQ writes use `mode: "replace"` for idempotency (safe to retry after crash).
 
 **Resume flow:**
 1. `finn resume <run_id>` fetches DLQ entry
@@ -781,6 +803,7 @@ finn/
 │   │   ├── errors.ts         # ExecutorError (graph validation errors)
 │   │   ├── executor.ts       # Topo-sort, parallel batches, Promise.allSettled
 │   │   ├── run-writer.ts     # Serialized RunRecord writes
+│   │   ├── event-fold.ts     # Derive status/retry/repair from events
 │   │   ├── semaphore.ts      # Counting semaphore for concurrency
 │   │   ├── batch.ts          # Group steps by dependency level
 │   │   └── idempotency.ts    # step_instance_id computation
@@ -809,6 +832,7 @@ finn/
 │   │   └── sqlite.ts         # SqliteArtifactStore
 │   ├── schemas/              # Zod schemas per artifact kind
 │   │   ├── index.ts          # Public exports
+│   │   ├── dlq-entry.ts      # DLQ entry for failed/blocked runs
 │   │   ├── explorer-finding.ts
 │   │   ├── run-record.ts     # + ErrorCode, Status, StepAction, StepEvent, StepRecord
 │   │   └── step-result.ts    # Crash recovery artifact
