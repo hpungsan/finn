@@ -1,9 +1,11 @@
-// Types
+// Event folding
 
 // Batch grouping
 export { groupIntoBatches } from "./batch.js";
 export type { ExecutorErrorCode } from "./errors.js";
 export { ExecutorError } from "./errors.js";
+export type { FoldedState } from "./event-fold.js";
+export { applyEventFold, foldEvents } from "./event-fold.js";
 export type {
   BackoffConfig,
   ExecuteOpts,

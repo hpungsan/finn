@@ -10,6 +10,7 @@ import {
 } from "../schemas/run-record.js";
 import type { PersistedStepResult } from "../schemas/step-result.js";
 import { ExecutorError } from "./errors.js";
+import { applyEventFold } from "./event-fold.js";
 import type { RunConfig, Step } from "./types.js";
 
 export interface RunWriterOpts {
@@ -106,6 +107,11 @@ export class RunWriter {
       );
     }
     const runRecord = parsed.data;
+
+    // Event sourcing: derive status/retry_count/repair_count from events
+    for (const step of runRecord.steps) {
+      applyEventFold(step);
+    }
 
     // Owner check
     if (runRecord.owner_id !== this.owner_id) {
@@ -547,6 +553,9 @@ export class RunWriter {
                 }
                 // Safe to reload and retry
                 this.runRecord = parsed.data;
+                for (const step of this.runRecord.steps) {
+                  applyEventFold(step);
+                }
                 this.currentVersion = existing.version;
                 continue;
               }

@@ -11,14 +11,15 @@ TypeScript, Claude Agent SDK, MCP TypeScript SDK (@modelcontextprotocol/sdk), Mo
 Before working on this project, read these design documents:
 
 **Build Order (active):**
-1. `dev/BUILD.md` — Current build phases and stages (gitignored, follow this)
+1. `dev/BUILD.md` — MVP route to a working `/plan` (fast path, not exhaustive)
+2. `dev/BUILD-FULL.md` — Full infrastructure checklist derived from FINN.md/artifacts.md (includes gaps; use when doing engine/storage durability work)
 
 **Core:**
-2. `docs/design/FINN.md` — Architecture, primitives, design principles
-3. `docs/design/artifacts.md` — Artifact store interface and storage semantics
+3. `docs/design/FINN.md` — Architecture, primitives, design principles
+4. `docs/design/artifacts.md` — Artifact store interface and storage semantics
 
 **Workflows:**
-4. `docs/design/plan.md` — Plan workflow: fan-out explorers, fan-in, stitcher
+5. `docs/design/plan.md` — Plan workflow: fan-out explorers, fan-in, stitcher
 
 ## Reference (as needed)
 
@@ -95,28 +96,18 @@ npm run check        # lint + typecheck (CI)
 ```
 
 ## Project Structure
-```
-finn/
-├── src/
-│   ├── index.ts              # MCP server entry
-│   ├── server.ts             # Tool definitions
-│   ├── workflows/
-│   │   ├── plan.ts           # Plan: fan-out/fan-in/stitch
-│   │   ├── feat.ts           # Feat: design/impl/verify loops
-│   │   └── fix.ts            # Fix: grouping + execution
-│   ├── subagents/
-│   │   ├── explorers/        # code, test, doc, migration
-│   │   ├── verifiers/        # design-verifier, impl-verifier
-│   │   └── stitcher.ts
-│   ├── grouping/
-│   │   └── fix-grouper.ts    # Overlap analysis
-│   ├── artifacts/
-│   │   └── store.ts          # Artifact storage layer
-│   └── moss/
-│       └── client.ts         # Moss MCP client (for Capsule export)
-├── package.json
-└── tsconfig.json
-```
+
+See `docs/design/FINN.md` → **Project Structure** section for the full file tree.
+
+Key directories:
+- `src/engine/` — Step execution harness (executor, run-writer, event-fold, idempotency, batching)
+- `src/artifacts/` — Storage layer (SqliteArtifactStore)
+- `src/schemas/` — Zod schemas (run-record, step-result, explorer-finding, dlq-entry)
+- `src/policies/` — TTL constants + storeArtifact wrapper
+- `src/renderers/` — Text renderers (data → markdown)
+- `src/workflows/` — Plan/feat/fix orchestration (not yet implemented)
+- `src/subagents/` — Explorers, verifiers, stitcher (not yet implemented)
+- `src/moss/` — Capsule export client (not yet implemented)
 
 ## Guidelines
 - Agent SDK for orchestration logic (loops, parallelism, error handling)

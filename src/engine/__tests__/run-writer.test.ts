@@ -649,6 +649,129 @@ describe("RunWriter", () => {
     });
   });
 
+  describe("event fold on resume", () => {
+    test("event fold corrects mismatched fields on resume", async () => {
+      // Create a RUNNING run with a step that has mismatched stored fields
+      const now = new Date().toISOString();
+      const runRecord: RunRecord = {
+        run_id: "fold-run-2",
+        owner_id: "owner-1",
+        status: "RUNNING",
+        workflow: "plan",
+        args: {},
+        repo_hash: "abc123",
+        config: defaultConfig,
+        steps: [
+          {
+            step_id: "step-1",
+            step_instance_id: "instance-1",
+            step_seq: 1,
+            name: "step-1",
+            status: "OK",
+            inputs_digest: "digest-1",
+            schema_version: "1.0",
+            events: [
+              { type: "STARTED", at: now },
+              { type: "RETRY", at: now, error: "TIMEOUT" },
+              {
+                type: "RETRY",
+                at: now,
+                error: "SCHEMA_INVALID",
+                repair_attempt: true,
+              },
+              { type: "OK", at: now },
+            ],
+            artifact_ids: [],
+            retry_count: 0, // Wrong — events say 2
+            repair_count: 0, // Wrong — events say 1
+          },
+        ],
+        created_at: now,
+        updated_at: now,
+      };
+
+      await store.store({
+        workspace: "runs",
+        name: "fold-run-2",
+        kind: "run-record",
+        data: runRecord,
+        ttl_seconds: 3600,
+      });
+
+      // Resume — event fold should correct the fields
+      const writer = new RunWriter({
+        store,
+        run_id: "fold-run-2",
+        owner_id: "owner-1",
+        workflow: "plan",
+        args: {},
+        repo_hash: "abc123",
+        config: defaultConfig,
+      });
+      const { runRecord: resumed, isResume } = await writer.init();
+
+      expect(isResume).toBe(true);
+      expect(resumed.steps[0].retry_count).toBe(2);
+      expect(resumed.steps[0].repair_count).toBe(1);
+      expect(resumed.steps[0].status).toBe("OK");
+    });
+
+    test("event fold does not modify error_code on resume", async () => {
+      const now = new Date().toISOString();
+      const runRecord: RunRecord = {
+        run_id: "fold-run-3",
+        owner_id: "owner-1",
+        status: "RUNNING",
+        workflow: "plan",
+        args: {},
+        repo_hash: "abc123",
+        config: defaultConfig,
+        steps: [
+          {
+            step_id: "step-1",
+            step_instance_id: "instance-1",
+            step_seq: 1,
+            name: "step-1",
+            status: "FAILED",
+            inputs_digest: "digest-1",
+            schema_version: "1.0",
+            events: [
+              { type: "STARTED", at: now },
+              { type: "FAILED", at: now },
+            ],
+            artifact_ids: [],
+            retry_count: 0,
+            repair_count: 0,
+            error_code: "TIMEOUT",
+          },
+        ],
+        created_at: now,
+        updated_at: now,
+      };
+
+      await store.store({
+        workspace: "runs",
+        name: "fold-run-3",
+        kind: "run-record",
+        data: runRecord,
+        ttl_seconds: 3600,
+      });
+
+      const writer = new RunWriter({
+        store,
+        run_id: "fold-run-3",
+        owner_id: "owner-1",
+        workflow: "plan",
+        args: {},
+        repo_hash: "abc123",
+        config: defaultConfig,
+      });
+      const { runRecord: resumed } = await writer.init();
+
+      expect(resumed.steps[0].error_code).toBe("TIMEOUT");
+    });
+  });
+
   describe("persistence", () => {
     test("persists RunRecord to store", async () => {
       const writer = new RunWriter({

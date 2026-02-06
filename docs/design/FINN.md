@@ -381,7 +381,9 @@ RETRY is internal to the engine loop — only terminal states are persisted as `
 
 **Canonical implementation:** `src/schemas/step-result.ts` — `StepRunnerResultSchema`, `PersistedStepResultSchema`
 
-**Event sourcing:** `events` is the source of truth. `status` and `retry_count` are derived on load by folding events. This ensures crash recovery correctness — no stale cached state.
+**Event sourcing:** `events` is the source of truth. `status`, `retry_count`, and `repair_count` are derived on load by folding events via `applyEventFold()`. Denormalized fields are still written for debugging, but overwritten on every load. `error_code` is excluded from the fold (events don't carry it; write-only). Drift between stored and derived values is logged via `console.debug`.
+
+**Canonical implementation:** `src/engine/event-fold.ts` — `foldEvents()`, `applyEventFold()`. Applied in `RunWriter.init()` (resume) and `persistWithRetry()` (VERSION_MISMATCH reload).
 
 **Enables:**
 - DLQ with resume point
@@ -801,6 +803,7 @@ finn/
 │   │   ├── errors.ts         # ExecutorError (graph validation errors)
 │   │   ├── executor.ts       # Topo-sort, parallel batches, Promise.allSettled
 │   │   ├── run-writer.ts     # Serialized RunRecord writes
+│   │   ├── event-fold.ts     # Derive status/retry/repair from events
 │   │   ├── semaphore.ts      # Counting semaphore for concurrency
 │   │   ├── batch.ts          # Group steps by dependency level
 │   │   └── idempotency.ts    # step_instance_id computation
