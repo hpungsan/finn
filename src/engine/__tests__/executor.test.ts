@@ -1877,6 +1877,320 @@ describe("execute - crash recovery hardening", () => {
     expect(dlqParsed.data.last_error).toBe("STEP_DEFINITION_MISMATCH");
     expect(dlqParsed.data.summary).not.toBe("old");
   });
+
+  test("finalize throws INVARIANT_VIOLATION if RUNNING steps remain", async () => {
+    const run_id = "test-run-invariant";
+    const owner_id = "owner-1";
+
+    // Create a RunRecord with a RUNNING step directly
+    await store.store({
+      workspace: "runs",
+      name: run_id,
+      kind: "run-record",
+      data: {
+        run_id,
+        owner_id,
+        status: "RUNNING",
+        workflow: "plan",
+        args: {},
+        repo_hash: "abc123",
+        config: { rounds: 2, retries: 2, timeout_ms: 60_000 },
+        steps: [
+          {
+            step_id: "orphan-step",
+            step_instance_id: "orphan-instance",
+            step_seq: 1,
+            name: "orphan-step",
+            status: "RUNNING",
+            inputs_digest: "digest",
+            schema_version: "1.0",
+            events: [{ type: "STARTED", at: new Date().toISOString() }],
+            artifact_ids: [],
+            retry_count: 0,
+            repair_count: 0,
+          },
+        ],
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      },
+      mode: "replace",
+    });
+
+    // Create RunWriter and init (resume mode)
+    const { RunWriter } = await import("../run-writer.js");
+    const writer = new RunWriter({
+      store,
+      run_id,
+      owner_id,
+      workflow: "plan",
+      args: {},
+      repo_hash: "abc123",
+      config: { rounds: 2, retries: 2, timeout_ms: 60_000 },
+    });
+    await writer.init();
+
+    // Attempt to finalize without calling blockRunningSteps()
+    await expect(writer.finalize("BLOCKED", "TIMEOUT")).rejects.toMatchObject({
+      code: "INVARIANT_VIOLATION",
+    });
+
+    // After blockRunningSteps(), finalize should succeed
+    await writer.blockRunningSteps("TIMEOUT");
+    const record = await writer.finalize("BLOCKED", "TIMEOUT");
+    expect(record.status).toBe("BLOCKED");
+    expect(record.steps.every((s) => s.status !== "RUNNING")).toBe(true);
+  });
+});
+
+describe("execute - DLQ entry on step failure", () => {
+  let store: SqliteArtifactStore;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    store = new SqliteArtifactStore({ dbPath: ":memory:" });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    store.close();
+  });
+
+  test("creates DLQ entry when step fails after retries exhausted", async () => {
+    let callCount = 0;
+    const failingStep = createMockStep({
+      id: "failing-step",
+      maxRetries: 2,
+      run: async () => {
+        callCount++;
+        return { status: "RETRY", error: "TIMEOUT" };
+      },
+    });
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [failingStep],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: { task: "test-task" },
+    });
+    await vi.runAllTimersAsync();
+    const result = await resultPromise;
+
+    expect(result.status).toBe("FAILED");
+    expect(callCount).toBe(3); // initial + 2 retries
+
+    // Verify DLQ entry was created
+    const dlqArtifact = await store.fetch({
+      workspace: "dlq",
+      name: ctx.run_id,
+    });
+    expect(dlqArtifact).not.toBeNull();
+
+    const dlqParsed = DlqEntrySchema.safeParse(dlqArtifact?.data);
+    expect(dlqParsed.success).toBe(true);
+    if (!dlqParsed.success) throw new Error("invalid dlq entry");
+
+    expect(dlqParsed.data.workflow).toBe("plan");
+    expect(dlqParsed.data.failed_step).toBe("failing-step");
+    expect(dlqParsed.data.last_error).toBe("TIMEOUT");
+    expect(dlqParsed.data.retry_count).toBe(2);
+    expect(dlqParsed.data.inputs).toEqual({ task: "test-task" });
+    expect(dlqParsed.data.summary).toContain("failing-step");
+    expect(dlqParsed.data.summary).toContain("TIMEOUT");
+  });
+
+  test("creates DLQ entry when step blocks with SCHEMA_INVALID", async () => {
+    const blockingStep = createMockStep({
+      id: "blocking-step",
+      run: async () => ({ status: "BLOCKED", error: "SCHEMA_INVALID" }),
+    });
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [blockingStep],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "feat",
+      args: {},
+    });
+    await vi.runAllTimersAsync();
+    const result = await resultPromise;
+
+    expect(result.status).toBe("BLOCKED");
+
+    const dlqArtifact = await store.fetch({
+      workspace: "dlq",
+      name: ctx.run_id,
+    });
+    expect(dlqArtifact).not.toBeNull();
+
+    const dlqParsed = DlqEntrySchema.safeParse(dlqArtifact?.data);
+    expect(dlqParsed.success).toBe(true);
+    if (!dlqParsed.success) throw new Error("invalid dlq entry");
+
+    expect(dlqParsed.data.workflow).toBe("feat");
+    expect(dlqParsed.data.failed_step).toBe("blocking-step");
+    expect(dlqParsed.data.last_error).toBe("SCHEMA_INVALID");
+  });
+
+  test("DLQ entry includes partial_results from completed steps", async () => {
+    const successStep = createMockStep({
+      id: "success-step",
+      run: async () => ({
+        status: "OK",
+        artifact_ids: ["artifact-1", "artifact-2"],
+      }),
+    });
+
+    const failingStep = createMockStep({
+      id: "failing-step",
+      deps: ["success-step"],
+      maxRetries: 0,
+      run: async () => ({ status: "RETRY", error: "RATE_LIMIT" }),
+    });
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [successStep, failingStep],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "fix",
+      args: {},
+    });
+    await vi.runAllTimersAsync();
+    const result = await resultPromise;
+
+    expect(result.status).toBe("FAILED");
+
+    const dlqArtifact = await store.fetch({
+      workspace: "dlq",
+      name: ctx.run_id,
+    });
+    const dlqParsed = DlqEntrySchema.safeParse(dlqArtifact?.data);
+    expect(dlqParsed.success).toBe(true);
+    if (!dlqParsed.success) throw new Error("invalid dlq entry");
+
+    expect(dlqParsed.data.partial_results).toEqual([
+      "artifact-1",
+      "artifact-2",
+    ]);
+  });
+
+  test("DLQ write is idempotent (mode: replace)", async () => {
+    const ctx = createMockContext(store);
+
+    // Pre-create an old DLQ entry
+    await store.store({
+      workspace: "dlq",
+      name: ctx.run_id,
+      kind: "dlq-entry",
+      data: {
+        workflow: "plan",
+        retry_count: 5,
+        last_error: "TIMEOUT",
+        summary: "old entry",
+      },
+      mode: "replace",
+    });
+
+    const failingStep = createMockStep({
+      id: "new-failing-step",
+      maxRetries: 1,
+      run: async () => ({ status: "BLOCKED", error: "HUMAN_REQUIRED" }),
+    });
+
+    const resultPromise = execute({
+      steps: [failingStep],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "feat",
+      args: {},
+    });
+    await vi.runAllTimersAsync();
+    await resultPromise;
+
+    const dlqArtifact = await store.fetch({
+      workspace: "dlq",
+      name: ctx.run_id,
+    });
+    const dlqParsed = DlqEntrySchema.safeParse(dlqArtifact?.data);
+    expect(dlqParsed.success).toBe(true);
+    if (!dlqParsed.success) throw new Error("invalid dlq entry");
+
+    // Should be the new entry, not the old one
+    expect(dlqParsed.data.workflow).toBe("feat");
+    expect(dlqParsed.data.failed_step).toBe("new-failing-step");
+    expect(dlqParsed.data.last_error).toBe("HUMAN_REQUIRED");
+    expect(dlqParsed.data.summary).not.toBe("old entry");
+  });
+
+  test("no DLQ entry created for successful runs", async () => {
+    const successStep = createMockStep({
+      id: "success-step",
+      run: async () => ({ status: "OK", artifact_ids: [] }),
+    });
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [successStep],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
+    });
+    await vi.runAllTimersAsync();
+    const result = await resultPromise;
+
+    expect(result.status).toBe("OK");
+
+    const dlqArtifact = await store.fetch({
+      workspace: "dlq",
+      name: ctx.run_id,
+    });
+    expect(dlqArtifact).toBeNull();
+  });
+
+  test("DLQ entry tracks correct retry_count from failed step", async () => {
+    let callCount = 0;
+    const failingStep = createMockStep({
+      id: "retry-step",
+      maxRetries: 5,
+      run: async () => {
+        callCount++;
+        return { status: "RETRY", error: "TOOL_ERROR_TRANSIENT" };
+      },
+    });
+
+    const ctx = createMockContext(store);
+    const resultPromise = execute({
+      steps: [failingStep],
+      ctx,
+      backoff: FAST_BACKOFF,
+      owner_id: "test-owner",
+      workflow: "plan",
+      args: {},
+    });
+    await vi.runAllTimersAsync();
+    await resultPromise;
+
+    expect(callCount).toBe(6); // initial + 5 retries
+
+    const dlqArtifact = await store.fetch({
+      workspace: "dlq",
+      name: ctx.run_id,
+    });
+    const dlqParsed = DlqEntrySchema.safeParse(dlqArtifact?.data);
+    expect(dlqParsed.success).toBe(true);
+    if (!dlqParsed.success) throw new Error("invalid dlq entry");
+
+    expect(dlqParsed.data.retry_count).toBe(5);
+  });
 });
 
 describe("execute - step-result TTL alignment", () => {

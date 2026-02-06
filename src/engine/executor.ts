@@ -884,6 +884,32 @@ export async function execute(opts: ExecuteOpts): Promise<ExecuteResult> {
     : "OK";
   await writer.finalize(finalStatus, finalError);
 
+  // 7. Create DLQ entry for failed/blocked runs
+  if (finalStatus !== "OK" && failedStep && finalError) {
+    const runRecord = writer.getRunRecord();
+    const failedResult = step_results.find((r) => r.step_id === failedStep);
+    const dlqEntry: DlqEntry = {
+      workflow,
+      failed_step: failedStep,
+      inputs: args,
+      retry_count: failedResult?.retry_count ?? 0,
+      last_error: finalError,
+      partial_results: runRecord?.steps
+        .filter((s) => s.status === "OK")
+        .flatMap((s) => s.artifact_ids),
+      summary: `Step ${failedStep} failed with ${finalError} after ${failedResult?.retry_count ?? 0} retries`,
+    };
+
+    await storeArtifact(ctx.store, {
+      workspace: "dlq",
+      name: ctx.run_id,
+      kind: "dlq-entry",
+      data: dlqEntry,
+      run_id: ctx.run_id,
+      mode: "replace",
+    });
+  }
+
   return {
     status: finalStatus,
     step_results,

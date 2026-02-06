@@ -299,6 +299,8 @@ This ensures resume never creates duplicate or orphan StepRecords, even when re-
 
 Additionally, all RUNNING StepRecords are converted to `BLOCKED` with `error_code: STEP_DEFINITION_MISMATCH` so finalized runs do not contain orphan RUNNING steps.
 
+**Invariant enforced:** `finalize()` throws `INVARIANT_VIOLATION` if any RUNNING steps remain. Callers must use `blockRunningSteps()` before `finalize()` when steps may be orphaned (e.g., definition mismatch, unrecoverable errors).
+
 This prevents orphan RUNNING runs and provides structured recovery path. Causes: workflow definition changed between crash and resume, or wrong workflow invoked for resume.
 
 **SQLite atomicity:** Step-result artifact + RunRecord event append should be a single SQLite transaction (`BEGIN IMMEDIATE`) when possible. RunWriter serializes writes through one connection. Crash recovery logic handles edge cases where transaction isn't achievable.
@@ -481,9 +483,11 @@ When a workflow fails after retries exhausted, store failure state for later res
 
 **Canonical implementation:** `src/schemas/dlq-entry.ts` — `DlqEntrySchema`
 
-**DLQ triggers:**
-- Workflow fails after retries exhausted
-- `STEP_DEFINITION_MISMATCH` on resume (workflow definitions changed)
+**DLQ triggers (automatic):**
+- Step fails/blocks after retries exhausted → DLQ entry with `retry_count`, `last_error`, `partial_results`
+- `STEP_DEFINITION_MISMATCH` on resume → DLQ entry with blocked step info
+
+DLQ writes use `mode: "replace"` for idempotency (safe to retry after crash).
 
 **Resume flow:**
 1. `finn resume <run_id>` fetches DLQ entry

@@ -369,6 +369,24 @@ export class RunWriter {
   ): Promise<RunRecord> {
     const now_ts = new Date().toISOString();
 
+    // Invariant: no RUNNING steps at finalize.
+    //
+    // Important: check before persisting any finalize changes to avoid partially
+    // finalized runs (e.g., terminal run status with RUNNING steps).
+    // Callers must use blockRunningSteps() before finalize() if steps may be orphaned.
+    const runningSteps = this.runRecord?.steps.filter(
+      (s) => s.status === "RUNNING",
+    );
+    if (runningSteps && runningSteps.length > 0) {
+      const stepIds = runningSteps.map((s) => s.step_id).join(", ");
+      throw new ExecutorError(
+        "INVARIANT_VIOLATION",
+        `Cannot finalize: ${runningSteps.length} steps still RUNNING: ${stepIds}. ` +
+          `Call blockRunningSteps() before finalize() to handle orphaned steps.`,
+        { run_id: this.run_id },
+      );
+    }
+
     await this.enqueueWrite((record) => {
       record.status = status;
       record.updated_at = now_ts;
