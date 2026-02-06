@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ErrorCodeSchema } from "./run-record.js";
 
 /**
  * DLQ Entry schema for failed/blocked workflow runs.
@@ -23,7 +24,7 @@ export const DlqEntrySchema = z.object({
   retry_count: z.number().int().nonnegative(),
 
   /** Error code that caused the failure */
-  last_error: z.string(),
+  last_error: ErrorCodeSchema,
 
   /** Files relevant to the failure (for context) */
   relevant_files: z.array(z.string()).optional(),

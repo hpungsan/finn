@@ -297,6 +297,8 @@ This ensures resume never creates duplicate or orphan StepRecords, even when re-
 2. Creates a DLQ entry with partial results (completed steps' artifacts)
 3. Throws `STEP_DEFINITION_MISMATCH` to the caller
 
+Additionally, all RUNNING StepRecords are converted to `BLOCKED` with `error_code: STEP_DEFINITION_MISMATCH` so finalized runs do not contain orphan RUNNING steps.
+
 This prevents orphan RUNNING runs and provides structured recovery path. Causes: workflow definition changed between crash and resume, or wrong workflow invoked for resume.
 
 **SQLite atomicity:** Step-result artifact + RunRecord event append should be a single SQLite transaction (`BEGIN IMMEDIATE`) when possible. RunWriter serializes writes through one connection. Crash recovery logic handles edge cases where transaction isn't achievable.

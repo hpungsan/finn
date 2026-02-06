@@ -758,6 +758,8 @@ export async function execute(opts: ExecuteOpts): Promise<ExecuteResult> {
     } catch (e) {
       // On definition mismatch, finalize as BLOCKED and create DLQ entry
       if (e instanceof ExecutorError && e.code === "STEP_DEFINITION_MISMATCH") {
+        // Ensure the run record does not retain orphan RUNNING steps.
+        await writer.blockRunningSteps("STEP_DEFINITION_MISMATCH");
         await writer.finalize("BLOCKED", "STEP_DEFINITION_MISMATCH");
 
         // Create DLQ entry for investigation/resume
@@ -780,6 +782,7 @@ export async function execute(opts: ExecuteOpts): Promise<ExecuteResult> {
           kind: "dlq-entry",
           data: dlqEntry,
           run_id: ctx.run_id,
+          mode: "replace",
         });
 
         throw e; // Re-throw so caller knows

@@ -1,6 +1,7 @@
 import { ArtifactError, type ArtifactStore } from "../artifacts/index.js";
 import { getRunRecordTtl, storeArtifact } from "../policies/ttl.js";
 import {
+  type ErrorCode,
   type RunRecord,
   RunRecordSchema,
   type StepAction,
@@ -332,6 +333,29 @@ export class RunWriter {
   }
 
   /**
+   * Block all RUNNING steps in the RunRecord.
+   *
+   * Used when recovery cannot proceed (e.g., step definition mismatch) to ensure
+   * finalized runs do not contain orphan RUNNING steps.
+   */
+  async blockRunningSteps(error_code: ErrorCode): Promise<void> {
+    const now_ts = new Date().toISOString();
+
+    await this.enqueueWrite((record) => {
+      for (const stepRecord of record.steps) {
+        if (stepRecord.status !== "RUNNING") continue;
+        stepRecord.status = "BLOCKED";
+        stepRecord.error_code = error_code;
+        stepRecord.events = [
+          ...stepRecord.events,
+          { type: "BLOCKED", at: now_ts },
+        ];
+      }
+      record.updated_at = now_ts;
+    });
+  }
+
+  /**
    * Finalize run status and align step-result TTLs.
    *
    * Step-results are stored with conservative 30-day TTL during execution.
@@ -385,7 +409,7 @@ export class RunWriter {
   private async alignStepResultTtls(ttlSeconds: number): Promise<void> {
     if (!this.runRecord) return;
 
-    // Only align terminal steps (skip RUNNING - shouldn't exist at finalize)
+    // Only align terminal steps (RUNNING steps are blocked by blockRunningSteps before finalize)
     const terminalSteps = this.runRecord.steps.filter(
       (s) =>
         s.status === "OK" || s.status === "BLOCKED" || s.status === "FAILED",
